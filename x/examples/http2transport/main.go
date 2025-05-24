@@ -1,4 +1,5 @@
 // Copyright 2023 The Outline Authors
+// https://claude.ai/chat/db78cb07-7844-4eeb-a467-8b27392d6dc5
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -96,16 +97,28 @@ func (c *tcpStreamConn) CloseWrite() error {
 	return nil
 }
 
-// isWhitelisted 检查域名是否在白名单中，支持子域名匹配
+// matchWildcard 检查目标字符串是否匹配给定的通配符模式
+func matchWildcard(pattern, target string) bool {
+	if pattern == "*" {
+		return true
+	}
+	if strings.HasPrefix(pattern, "*.") {
+		suffix := pattern[2:]
+		return strings.HasSuffix(target, suffix) || target == suffix
+	}
+	return pattern == target
+}
+
+// isWhitelisted 检查域名是否在白名单中，支持通配符匹配
 func (d *WhitelistDialer) isWhitelisted(host string) bool {
 	// 检查完整域名是否在白名单中
 	if d.whitelist[host] {
 		return true
 	}
 
-	// 检查是否为白名单中某个域名的子域名
-	for domain := range d.whitelist {
-		if strings.HasSuffix(host, "."+domain) {
+	// 检查是否匹配白名单中的通配符规则
+	for pattern := range d.whitelist {
+		if matchWildcard(pattern, host) {
 			return true
 		}
 	}

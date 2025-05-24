@@ -1,3 +1,15 @@
+# support whitelist argument to bypass some domain
+
+add this to your ~/.bashrc
+```
+ export OUTLINE_KEY="ss://yourhash@yourip:yourport/?outline=1&prefix=%16%03%01%00%C2%A8%01%01"
+```
+run this command
+```
+ go build
+./http2transport -transport "$OUTLINE_KEY" -localAddr localhost:1080  -whitelist "*baidu.com,*.qq.com,*.cn,*douban.com"
+```
+
 # HTTP-to-Transport
 
 This app runs a local HTTP-CONNECT proxy that dials the target using the transport configured in the command-line.
