@@ -67,6 +67,7 @@ func main() {
 	transportFlag := flag.String("transport", "", "The base transport for the connections")
 	var domainsFlag stringArrayFlagValue
 	flag.Var(&domainsFlag, "domain", "The test domains to find strategies.")
+	cacheFlag := flag.String("cacheFile", "", "The file used to cache strategies")
 
 	flag.Parse()
 	if *verboseFlag {
@@ -110,16 +111,25 @@ func main() {
 			return innerDialer.DialStream(ctx, addr)
 		})
 	}
+
 	finder := smart.StrategyFinder{
 		LogWriter:    debugLog.Writer(),
 		TestTimeout:  5 * time.Second,
 		StreamDialer: streamDialer,
 		PacketDialer: packetDialer,
 	}
+	if len(*cacheFlag) > 0 {
+		if cache, err := NewJSONFileCache(*cacheFlag); err == nil {
+			finder.Cache = cache
+		}
+	}
 
 	fmt.Println("Finding strategy")
 	startTime := time.Now()
-	dialer, err := finder.NewDialer(context.Background(), domainsFlag, finderConfig)
+	findCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dialer, err := finder.NewDialer(findCtx, domainsFlag, finderConfig)
 	if err != nil {
 		log.Fatalf("Failed to find dialer: %v", err)
 	}
