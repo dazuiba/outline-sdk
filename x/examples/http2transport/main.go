@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -36,10 +37,12 @@ type WhitelistDialer struct {
 	proxyDialer transport.StreamDialer
 	// 域名白名单
 	whitelist map[string]bool
+	// 流量统计
+	stats *httpproxy.TrafficStats
 }
 
 // NewWhitelistDialer 创建一个新的WhitelistDialer
-func NewWhitelistDialer(proxyDialer transport.StreamDialer, whitelistDomains []string) *WhitelistDialer {
+func NewWhitelistDialer(proxyDialer transport.StreamDialer, whitelistDomains []string, stats *httpproxy.TrafficStats) *WhitelistDialer {
 	whitelist := make(map[string]bool)
 	for _, domain := range whitelistDomains {
 		whitelist[domain] = true
@@ -48,6 +51,7 @@ func NewWhitelistDialer(proxyDialer transport.StreamDialer, whitelistDomains []s
 	return &WhitelistDialer{
 		proxyDialer: proxyDialer,
 		whitelist:   whitelist,
+		stats:       stats,
 	}
 }
 
@@ -67,13 +71,25 @@ func (d *WhitelistDialer) DialStream(ctx context.Context, address string) (trans
 		if err != nil {
 			return nil, err
 		}
-		// 将net.Conn转换为transport.StreamConn
-		return &tcpStreamConn{Conn: conn}, nil
+		// 将net.Conn转换为transport.StreamConn并包装监控
+		wrappedConn := &tcpStreamConn{Conn: conn}
+		if d.stats != nil {
+			return httpproxy.NewMonitoredConn(wrappedConn, d.stats), nil
+		}
+		return wrappedConn, nil
 	}
 
 	// 不在白名单中，使用代理连接
 	log.Printf("使用代理连接 %s", address)
-	return d.proxyDialer.DialStream(ctx, address)
+	conn, err := d.proxyDialer.DialStream(ctx, address)
+	if err != nil {
+		return nil, err
+	}
+	// 为代理连接也添加监控
+	if d.stats != nil {
+		return httpproxy.NewMonitoredConn(conn, d.stats), nil
+	}
+	return conn, nil
 }
 
 // tcpStreamConn 实现了transport.StreamConn接口，包装了标准库的net.Conn
@@ -146,8 +162,11 @@ func main() {
 		log.Printf("域名白名单: %v", whitelistDomains)
 	}
 
+	// 创建流量统计
+	stats := httpproxy.NewTrafficStats()
+
 	// 创建带白名单的拨号器
-	dialer := NewWhitelistDialer(baseDialer, whitelistDomains)
+	dialer := NewWhitelistDialer(baseDialer, whitelistDomains, stats)
 
 	listener, err := net.Listen("tcp", *addrFlag)
 	if err != nil {
@@ -161,7 +180,37 @@ func main() {
 	if *urlProxyPrefixFlag != "" {
 		proxyHandler.FallbackHandler = http.StripPrefix(*urlProxyPrefixFlag, httpproxy.NewPathHandler(dialer))
 	}
-	server := http.Server{Handler: proxyHandler}
+
+	// 创建一个handler来分离代理请求和统计请求
+	mainHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 处理统计端点
+		if r.Method == http.MethodGet && r.URL.Path == "/stats" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			statsJSON := fmt.Sprintf(`{
+				"uploadBytes": %d,
+				"downloadBytes": %d,
+				"totalConnectionTime": %d,
+				"currentSessionDuration": %d,
+				"activeConnections": %d,
+				"totalConnections": %d
+			}`, 
+				stats.GetUploadBytes(),
+				stats.GetDownloadBytes(),
+				stats.GetTotalConnectionTime(),
+				stats.GetCurrentSessionDuration(),
+				stats.GetActiveConnections(),
+				stats.GetTotalConnections(),
+			)
+			w.Write([]byte(statsJSON))
+			return
+		}
+		
+		// 其他所有请求交给代理handler处理（包括CONNECT方法）
+		proxyHandler.ServeHTTP(w, r)
+	})
+
+	server := http.Server{Handler: mainHandler}
 	go func() {
 		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Error running web server: %v", err)

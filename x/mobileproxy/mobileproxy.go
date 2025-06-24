@@ -43,6 +43,7 @@ type Proxy struct {
 	port         int
 	proxyHandler *httpproxy.ProxyHandler
 	server       *http.Server
+	stats        *httpproxy.TrafficStats
 }
 
 // Address returns the IP and port the server is bound to.
@@ -58,6 +59,62 @@ func (p *Proxy) Host() string {
 // Port returns the port the server is bound to.
 func (p *Proxy) Port() int {
 	return p.port
+}
+
+// GetUploadBytes returns the total number of bytes uploaded.
+func (p *Proxy) GetUploadBytes() int64 {
+	if p.stats == nil {
+		return 0
+	}
+	return p.stats.GetUploadBytes()
+}
+
+// GetDownloadBytes returns the total number of bytes downloaded.
+func (p *Proxy) GetDownloadBytes() int64 {
+	if p.stats == nil {
+		return 0
+	}
+	return p.stats.GetDownloadBytes()
+}
+
+// GetTotalConnectionTime returns the total connection time in milliseconds.
+func (p *Proxy) GetTotalConnectionTime() int64 {
+	if p.stats == nil {
+		return 0
+	}
+	return p.stats.GetTotalConnectionTime()
+}
+
+// GetCurrentSessionDuration returns the duration of the current session in milliseconds.
+// This is the time since the first connection was established.
+func (p *Proxy) GetCurrentSessionDuration() int64 {
+	if p.stats == nil {
+		return 0
+	}
+	return p.stats.GetCurrentSessionDuration()
+}
+
+// GetActiveConnections returns the number of currently active connections.
+func (p *Proxy) GetActiveConnections() int64 {
+	if p.stats == nil {
+		return 0
+	}
+	return p.stats.GetActiveConnections()
+}
+
+// GetTotalConnections returns the total number of connections established.
+func (p *Proxy) GetTotalConnections() int64 {
+	if p.stats == nil {
+		return 0
+	}
+	return p.stats.GetTotalConnections()
+}
+
+// ResetTrafficStats resets all traffic and connection statistics.
+func (p *Proxy) ResetTrafficStats() {
+	if p.stats != nil {
+		p.stats.Reset()
+	}
 }
 
 // AddURLProxy sets up a URL-based proxy handler that activates when an incoming HTTP request matches
@@ -114,11 +171,18 @@ func RunProxy(localAddress string, dialer *StreamDialer) (*Proxy, error) {
 		return nil, errors.New("dialer must not be nil. Please create and pass a valid StreamDialer")
 	}
 
+	// Create traffic statistics tracker
+	stats := httpproxy.NewTrafficStats()
+	
+	// Wrap the dialer with monitoring capabilities
+	monitoredDialer := httpproxy.NewMonitoredDialer(dialer.StreamDialer, stats)
+	wrappedDialer := &StreamDialer{monitoredDialer}
+	
 	// The default http.Server doesn't close hijacked connections or cancel in-flight request contexts during
 	// shutdown. This can lead to lingering connections. We'll create a base context, propagated to requests,
 	// that is cancelled on shutdown. This enables handlers to gracefully terminate requests and close connections.
 	serverCtx, cancelCtx := context.WithCancelCause(context.Background())
-	proxyHandler := httpproxy.NewProxyHandler(dialer)
+	proxyHandler := httpproxy.NewProxyHandler(wrappedDialer)
 	proxyHandler.FallbackHandler = http.NotFoundHandler()
 	server := &http.Server{
 		Handler: proxyHandler,
@@ -144,6 +208,7 @@ func RunProxy(localAddress string, dialer *StreamDialer) (*Proxy, error) {
 		port:         port,
 		server:       server,
 		proxyHandler: proxyHandler,
+		stats:        stats,
 	}, nil
 }
 

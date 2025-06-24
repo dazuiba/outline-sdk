@@ -27,3 +27,10 @@ output-metadata.json
 # Tasks
 .task
 out
+x/examples/website-wrapper-app/wrapper_app_project/template/ios/App/App.xcodeproj/project.xcworkspace/contents.xcworkspacedata
+x/examples/outline-connectivity-app/shared_backend/package-lock.json
+x/examples/outline-connectivity-app/app_mobile/ios/App/App.xcworkspace/xcuserdata/sam.xcuserdatad/UserInterfaceState.xcuserstate
+x/examples/outline-connectivity-app/app_mobile/ios/App/App.xcodeproj/xcuserdata/sam.xcuserdatad/xcschemes
+x/examples/outline-connectivity-app/app_desktop/generated/wailsjs/runtime/package-lock.json
+x/examples/outline-connectivity-app/.yarn
+x/examples/http2transport/http2transport
