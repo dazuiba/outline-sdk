@@ -16,14 +16,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Jigsaw-Code/outline-sdk/transport"
@@ -31,27 +33,148 @@ import (
 	"github.com/Jigsaw-Code/outline-sdk/x/httpproxy"
 )
 
+// DomainStats 存储单个域名的流量统计
+type DomainStats struct {
+	uploadBytes   int64
+	downloadBytes int64
+}
+
+// DomainTrafficStats 管理按域名分组的流量统计
+type DomainTrafficStats struct {
+	mu          sync.RWMutex
+	domainStats map[string]*DomainStats
+	globalStats *httpproxy.TrafficStats
+}
+
+// NewDomainTrafficStats 创建新的域名流量统计实例
+func NewDomainTrafficStats() *DomainTrafficStats {
+	return &DomainTrafficStats{
+		domainStats: make(map[string]*DomainStats),
+		globalStats: httpproxy.NewTrafficStats(),
+	}
+}
+
+// AddTraffic 为指定域名添加流量统计
+func (dts *DomainTrafficStats) AddTraffic(domain string, uploadBytes, downloadBytes int64) {
+	if domain == "" {
+		return
+	}
+	
+	dts.mu.Lock()
+	defer dts.mu.Unlock()
+	
+	if _, exists := dts.domainStats[domain]; !exists {
+		dts.domainStats[domain] = &DomainStats{}
+	}
+	
+	atomic.AddInt64(&dts.domainStats[domain].uploadBytes, uploadBytes)
+	atomic.AddInt64(&dts.domainStats[domain].downloadBytes, downloadBytes)
+}
+
+// GetDomainStats 获取指定域名的流量统计
+func (dts *DomainTrafficStats) GetDomainStats(domain string) (uploadBytes, downloadBytes int64) {
+	dts.mu.RLock()
+	defer dts.mu.RUnlock()
+	
+	if stats, exists := dts.domainStats[domain]; exists {
+		return atomic.LoadInt64(&stats.uploadBytes), atomic.LoadInt64(&stats.downloadBytes)
+	}
+	return 0, 0
+}
+
+// GetAllDomainStats 获取所有域名的流量统计
+func (dts *DomainTrafficStats) GetAllDomainStats() map[string]map[string]int64 {
+	dts.mu.RLock()
+	defer dts.mu.RUnlock()
+	
+	result := make(map[string]map[string]int64)
+	for domain, stats := range dts.domainStats {
+		result[domain] = map[string]int64{
+			"uploadBytes":   atomic.LoadInt64(&stats.uploadBytes),
+			"downloadBytes": atomic.LoadInt64(&stats.downloadBytes),
+		}
+	}
+	return result
+}
+
+// GetGlobalStats 获取全局流量统计
+func (dts *DomainTrafficStats) GetGlobalStats() *httpproxy.TrafficStats {
+	return dts.globalStats
+}
+
+// DomainMonitoredConn 带域名跟踪的连接包装器
+type DomainMonitoredConn struct {
+	transport.StreamConn
+	domain      string
+	domainStats *DomainTrafficStats
+	globalConn  transport.StreamConn // 用于全局统计的连接
+}
+
+// NewDomainMonitoredConn 创建带域名跟踪的连接
+func NewDomainMonitoredConn(conn transport.StreamConn, domain string, domainStats *DomainTrafficStats) *DomainMonitoredConn {
+	// 为全局统计创建监控连接
+	globalConn := httpproxy.NewMonitoredConn(conn, domainStats.GetGlobalStats())
+	
+	return &DomainMonitoredConn{
+		StreamConn:  conn,
+		domain:      domain,
+		domainStats: domainStats,
+		globalConn:  globalConn,
+	}
+}
+
+// Read 重写读取方法以跟踪下载流量
+func (dmc *DomainMonitoredConn) Read(b []byte) (int, error) {
+	n, err := dmc.globalConn.Read(b)
+	if n > 0 {
+		dmc.domainStats.AddTraffic(dmc.domain, 0, int64(n))
+	}
+	return n, err
+}
+
+// Write 重写写入方法以跟踪上传流量
+func (dmc *DomainMonitoredConn) Write(b []byte) (int, error) {
+	n, err := dmc.globalConn.Write(b)
+	if n > 0 {
+		dmc.domainStats.AddTraffic(dmc.domain, int64(n), 0)
+	}
+	return n, err
+}
+
+// Close 重写关闭方法
+func (dmc *DomainMonitoredConn) Close() error {
+	return dmc.globalConn.Close()
+}
+
 // WhitelistDialer 实现了一个带有域名白名单的拨号器
 type WhitelistDialer struct {
 	// 原始拨号器，用于通过shadowsocks代理连接
 	proxyDialer transport.StreamDialer
 	// 域名白名单
 	whitelist map[string]bool
-	// 流量统计
-	stats *httpproxy.TrafficStats
+	// 域名流量统计
+	domainStats *DomainTrafficStats
+	// 监控域名列表
+	monitorDomains map[string]bool
 }
 
 // NewWhitelistDialer 创建一个新的WhitelistDialer
-func NewWhitelistDialer(proxyDialer transport.StreamDialer, whitelistDomains []string, stats *httpproxy.TrafficStats) *WhitelistDialer {
+func NewWhitelistDialer(proxyDialer transport.StreamDialer, whitelistDomains []string, monitorDomains []string, domainStats *DomainTrafficStats) *WhitelistDialer {
 	whitelist := make(map[string]bool)
 	for _, domain := range whitelistDomains {
 		whitelist[domain] = true
 	}
 
+	monitorDomainsMap := make(map[string]bool)
+	for _, domain := range monitorDomains {
+		monitorDomainsMap[domain] = true
+	}
+
 	return &WhitelistDialer{
-		proxyDialer: proxyDialer,
-		whitelist:   whitelist,
-		stats:       stats,
+		proxyDialer:    proxyDialer,
+		whitelist:      whitelist,
+		domainStats:    domainStats,
+		monitorDomains: monitorDomainsMap,
 	}
 }
 
@@ -63,6 +186,9 @@ func (d *WhitelistDialer) DialStream(ctx context.Context, address string) (trans
 		return nil, err
 	}
 
+	// 检查是否应该监控这个域名
+	shouldMonitorDomain := d.shouldMonitor(host)
+
 	// 检查域名是否在白名单中
 	if d.isWhitelisted(host) {
 		log.Printf("使用直连连接 %s", address)
@@ -71,10 +197,10 @@ func (d *WhitelistDialer) DialStream(ctx context.Context, address string) (trans
 		if err != nil {
 			return nil, err
 		}
-		// 将net.Conn转换为transport.StreamConn并包装监控
+		// 将net.Conn转换为transport.StreamConn并根据域名监控设置包装监控
 		wrappedConn := &tcpStreamConn{Conn: conn}
-		if d.stats != nil {
-			return httpproxy.NewMonitoredConn(wrappedConn, d.stats), nil
+		if d.domainStats != nil && shouldMonitorDomain {
+			return NewDomainMonitoredConn(wrappedConn, host, d.domainStats), nil
 		}
 		return wrappedConn, nil
 	}
@@ -85,9 +211,9 @@ func (d *WhitelistDialer) DialStream(ctx context.Context, address string) (trans
 	if err != nil {
 		return nil, err
 	}
-	// 为代理连接也添加监控
-	if d.stats != nil {
-		return httpproxy.NewMonitoredConn(conn, d.stats), nil
+	// 为代理连接也根据域名监控设置添加监控
+	if d.domainStats != nil && shouldMonitorDomain {
+		return NewDomainMonitoredConn(conn, host, d.domainStats), nil
 	}
 	return conn, nil
 }
@@ -142,11 +268,34 @@ func (d *WhitelistDialer) isWhitelisted(host string) bool {
 	return false
 }
 
+// shouldMonitor 检查域名是否应该被监控
+func (d *WhitelistDialer) shouldMonitor(host string) bool {
+	// 如果没有设置监控域名列表，则监控所有域名
+	if len(d.monitorDomains) == 0 {
+		return true
+	}
+
+	// 检查完整域名是否在监控列表中
+	if d.monitorDomains[host] {
+		return true
+	}
+
+	// 检查是否匹配监控列表中的通配符规则
+	for pattern := range d.monitorDomains {
+		if matchWildcard(pattern, host) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func main() {
 	transportFlag := flag.String("transport", "", "Transport config")
 	addrFlag := flag.String("localAddr", "localhost:1080", "Local proxy address")
 	urlProxyPrefixFlag := flag.String("urlProxyPrefix", "/proxy", "Path where to run the URL proxy. Set to empty (\"\") to disable it.")
 	whitelistFlag := flag.String("whitelist", "", "Comma-separated list of domains to bypass proxy")
+	monitorDomainsFlag := flag.String("monitorDomains", "", "Comma-separated list of domains to monitor traffic for (empty = monitor all)")
 	flag.Parse()
 
 	// 创建原始拨号器
@@ -162,11 +311,18 @@ func main() {
 		log.Printf("域名白名单: %v", whitelistDomains)
 	}
 
-	// 创建流量统计
-	stats := httpproxy.NewTrafficStats()
+	// 解析监控域名
+	var monitorDomains []string
+	if *monitorDomainsFlag != "" {
+		monitorDomains = strings.Split(*monitorDomainsFlag, ",")
+		log.Printf("监控域名: %v", monitorDomains)
+	}
+
+	// 创建域名流量统计
+	domainStats := NewDomainTrafficStats()
 
 	// 创建带白名单的拨号器
-	dialer := NewWhitelistDialer(baseDialer, whitelistDomains, stats)
+	dialer := NewWhitelistDialer(baseDialer, whitelistDomains, monitorDomains, domainStats)
 
 	listener, err := net.Listen("tcp", *addrFlag)
 	if err != nil {
@@ -187,22 +343,27 @@ func main() {
 		if r.Method == http.MethodGet && r.URL.Path == "/stats" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			statsJSON := fmt.Sprintf(`{
-				"uploadBytes": %d,
-				"downloadBytes": %d,
-				"totalConnectionTime": %d,
-				"currentSessionDuration": %d,
-				"activeConnections": %d,
-				"totalConnections": %d
-			}`, 
-				stats.GetUploadBytes(),
-				stats.GetDownloadBytes(),
-				stats.GetTotalConnectionTime(),
-				stats.GetCurrentSessionDuration(),
-				stats.GetActiveConnections(),
-				stats.GetTotalConnections(),
-			)
-			w.Write([]byte(statsJSON))
+			globalStats := domainStats.GetGlobalStats()
+			allDomainStats := domainStats.GetAllDomainStats()
+			
+			// 构建完整的统计响应
+			response := map[string]interface{}{
+				"uploadBytes":             globalStats.GetUploadBytes(),
+				"downloadBytes":           globalStats.GetDownloadBytes(),
+				"outlineConnectionTime":   globalStats.GetCurrentSessionDuration(),
+				"currentSessionDuration":  globalStats.GetCurrentSessionDuration(),
+				"activeConnections":       globalStats.GetActiveConnections(),
+				"totalConnections":        globalStats.GetTotalConnections(),
+				"monitoredDomains":        allDomainStats,
+			}
+			
+			jsonData, err := json.Marshal(response)
+			if err != nil {
+				http.Error(w, "Failed to marshal JSON", http.StatusInternalServerError)
+				return
+			}
+			
+			w.Write(jsonData)
 			return
 		}
 		

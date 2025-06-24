@@ -27,7 +27,7 @@ curl http://localhost:1080/stats
 {
     "uploadBytes": 1024,
     "downloadBytes": 2048,
-    "totalConnectionTime": 5000,
+    "outlineConnectionTime": 5000,
     "currentSessionDuration": 30000,
     "activeConnections": 2,
     "totalConnections": 10
