@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -32,6 +33,47 @@ import (
 	"github.com/Jigsaw-Code/outline-sdk/x/configurl"
 	"github.com/Jigsaw-Code/outline-sdk/x/httpproxy"
 )
+
+// formatBytes 将字节数转换为人类可读的格式
+func formatBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+// formatDuration 将毫秒数转换为人类可读的时间格式
+func formatDuration(milliseconds int64) string {
+	duration := time.Duration(milliseconds) * time.Millisecond
+	
+	days := int(duration.Hours()) / 24
+	hours := int(duration.Hours()) % 24
+	minutes := int(duration.Minutes()) % 60
+	seconds := int(duration.Seconds()) % 60
+	
+	if days > 0 {
+		if hours > 0 {
+			return fmt.Sprintf("%d天%d小时", days, hours)
+		}
+		return fmt.Sprintf("%d天", days)
+	}
+	if hours > 0 {
+		if minutes > 0 {
+			return fmt.Sprintf("%d小时%d分钟", hours, minutes)
+		}
+		return fmt.Sprintf("%d小时", hours)
+	}
+	if minutes > 0 {
+		return fmt.Sprintf("%d分钟", minutes)
+	}
+	return fmt.Sprintf("%d秒", seconds)
+}
 
 // DomainStats 存储单个域名的流量统计
 type DomainStats struct {
@@ -82,16 +124,18 @@ func (dts *DomainTrafficStats) GetDomainStats(domain string) (uploadBytes, downl
 	return 0, 0
 }
 
-// GetAllDomainStats 获取所有域名的流量统计
-func (dts *DomainTrafficStats) GetAllDomainStats() map[string]map[string]int64 {
+// GetAllDomainStats 获取所有域名的流量统计（人类可读格式）
+func (dts *DomainTrafficStats) GetAllDomainStats() map[string]map[string]string {
 	dts.mu.RLock()
 	defer dts.mu.RUnlock()
 	
-	result := make(map[string]map[string]int64)
+	result := make(map[string]map[string]string)
 	for domain, stats := range dts.domainStats {
-		result[domain] = map[string]int64{
-			"uploadBytes":   atomic.LoadInt64(&stats.uploadBytes),
-			"downloadBytes": atomic.LoadInt64(&stats.downloadBytes),
+		uploadBytes := atomic.LoadInt64(&stats.uploadBytes)
+		downloadBytes := atomic.LoadInt64(&stats.downloadBytes)
+		result[domain] = map[string]string{
+			"uploadBytes":   formatBytes(uploadBytes),
+			"downloadBytes": formatBytes(downloadBytes),
 		}
 	}
 	return result
@@ -348,16 +392,16 @@ func main() {
 			
 			// 构建完整的统计响应
 			response := map[string]interface{}{
-				"uploadBytes":             globalStats.GetUploadBytes(),
-				"downloadBytes":           globalStats.GetDownloadBytes(),
-				"outlineConnectionTime":   globalStats.GetCurrentSessionDuration(),
-				"currentSessionDuration":  globalStats.GetCurrentSessionDuration(),
+				"uploadBytes":             formatBytes(globalStats.GetUploadBytes()),
+				"downloadBytes":           formatBytes(globalStats.GetDownloadBytes()),
+				"outlineConnectionTime":   formatDuration(globalStats.GetCurrentSessionDuration()),
+				"currentSessionDuration":  formatDuration(globalStats.GetCurrentSessionDuration()),
 				"activeConnections":       globalStats.GetActiveConnections(),
 				"totalConnections":        globalStats.GetTotalConnections(),
 				"monitoredDomains":        allDomainStats,
 			}
 			
-			jsonData, err := json.Marshal(response)
+			jsonData, err := json.MarshalIndent(response, "", "  ")
 			if err != nil {
 				http.Error(w, "Failed to marshal JSON", http.StatusInternalServerError)
 				return
