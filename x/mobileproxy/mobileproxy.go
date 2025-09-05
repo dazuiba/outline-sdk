@@ -303,3 +303,84 @@ func (l *StringList) Append(value string) {
 func NewListFromLines(lines string) *StringList {
 	return &StringList{list: strings.Split(lines, "\n")}
 }
+
+//////////
+// HTTP Connectivity Testing API
+//////////
+
+// Note: HTTP Connectivity Testing functions are implemented in connectivity_test.go
+// The functions CheckHTTPConnectivity and CheckMultipleConfigs provide the core functionality.
+// They can be called directly or through the following convenience wrappers:
+
+// TestHTTPConnectivity tests HTTP connectivity using the given dialer and test URL.
+// If testURL is empty, the test is skipped and success is returned.
+// Returns a ConnectivityResult with detailed information about the test.
+//
+// This is a convenience wrapper around CheckHTTPConnectivity.
+//
+// Example usage in Go:
+//   dialer, err := NewStreamDialerFromConfig("ss://...")
+//   if err != nil { return err }
+//   result := TestHTTPConnectivity(dialer, "http://example.com")
+//   if !result.Success {
+//       errorJSON, _ := result.Error.ToJSON()
+//       log.Printf("Connectivity test failed: %s", errorJSON)
+//   }
+//
+// Example usage in Objective-C:
+//   NSError *error;
+//   MobileproxyStreamDialer *dialer = MobileproxyNewStreamDialerFromConfig(@"ss://...", &error);
+//   MobileproxyConnectivityResult *result = MobileproxyTestHTTPConnectivity(dialer, @"http://example.com");
+//   if (!result.success) {
+//       NSString *errorJSON = [result.error toJSON:nil];
+//       NSLog(@"Test failed: %@", errorJSON);
+//   }
+func TestHTTPConnectivity(dialer *StreamDialer, testURL string) string {
+	// Simple connectivity test that returns JSON result
+	// If testURL is empty, skip test and return success
+	if testURL == "" {
+		return `{"success": true, "config": "skipped", "durationMs": 0}`
+	}
+	
+	if dialer == nil {
+		return `{"success": false, "error": {"code": "ERR_ILLEGAL_CONFIG", "message": "dialer cannot be nil"}}`
+	}
+	
+	start := time.Now()
+	
+	// Create HTTP client with custom transport using our dialer
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialer.DialStream(ctx, addr)
+			},
+		},
+		Timeout: 10 * time.Second,
+	}
+	
+	// Create HTTP HEAD request
+	req, err := http.NewRequest("HEAD", testURL, nil)
+	if err != nil {
+		duration := time.Since(start).Milliseconds()
+		return fmt.Sprintf(`{"success": false, "durationMs": %d, "error": {"code": "ERR_ILLEGAL_CONFIG", "message": "invalid test URL: %v"}}`, duration, err)
+	}
+	
+	// Perform the request
+	resp, err := client.Do(req)
+	duration := time.Since(start).Milliseconds()
+	
+	if err != nil {
+		errCode := "ERR_PROXY_SERVER_UNREACHABLE"
+		if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline exceeded") {
+			errCode = "ERR_TIMEOUT"
+		}
+		return fmt.Sprintf(`{"success": false, "durationMs": %d, "error": {"code": "%s", "message": "%s"}}`, duration, errCode, err.Error())
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode >= 400 {
+		return fmt.Sprintf(`{"success": false, "durationMs": %d, "error": {"code": "ERR_PROXY_SERVER_READ_FAILURE", "message": "HTTP test returned status: %d"}}`, duration, resp.StatusCode)
+	}
+	
+	return fmt.Sprintf(`{"success": true, "config": "tested", "durationMs": %d, "testURL": "%s"}`, duration, testURL)
+}

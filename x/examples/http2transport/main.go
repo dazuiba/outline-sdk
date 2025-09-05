@@ -16,9 +16,11 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -51,12 +53,12 @@ func formatBytes(bytes int64) string {
 // formatDuration 将毫秒数转换为人类可读的时间格式
 func formatDuration(milliseconds int64) string {
 	duration := time.Duration(milliseconds) * time.Millisecond
-	
+
 	days := int(duration.Hours()) / 24
 	hours := int(duration.Hours()) % 24
 	minutes := int(duration.Minutes()) % 60
 	seconds := int(duration.Seconds()) % 60
-	
+
 	if days > 0 {
 		if hours > 0 {
 			return fmt.Sprintf("%d天%d小时", days, hours)
@@ -101,14 +103,14 @@ func (dts *DomainTrafficStats) AddTraffic(domain string, uploadBytes, downloadBy
 	if domain == "" {
 		return
 	}
-	
+
 	dts.mu.Lock()
 	defer dts.mu.Unlock()
-	
+
 	if _, exists := dts.domainStats[domain]; !exists {
 		dts.domainStats[domain] = &DomainStats{}
 	}
-	
+
 	atomic.AddInt64(&dts.domainStats[domain].uploadBytes, uploadBytes)
 	atomic.AddInt64(&dts.domainStats[domain].downloadBytes, downloadBytes)
 }
@@ -117,7 +119,7 @@ func (dts *DomainTrafficStats) AddTraffic(domain string, uploadBytes, downloadBy
 func (dts *DomainTrafficStats) GetDomainStats(domain string) (uploadBytes, downloadBytes int64) {
 	dts.mu.RLock()
 	defer dts.mu.RUnlock()
-	
+
 	if stats, exists := dts.domainStats[domain]; exists {
 		return atomic.LoadInt64(&stats.uploadBytes), atomic.LoadInt64(&stats.downloadBytes)
 	}
@@ -128,7 +130,7 @@ func (dts *DomainTrafficStats) GetDomainStats(domain string) (uploadBytes, downl
 func (dts *DomainTrafficStats) GetAllDomainStats() map[string]map[string]string {
 	dts.mu.RLock()
 	defer dts.mu.RUnlock()
-	
+
 	result := make(map[string]map[string]string)
 	for domain, stats := range dts.domainStats {
 		uploadBytes := atomic.LoadInt64(&stats.uploadBytes)
@@ -158,7 +160,7 @@ type DomainMonitoredConn struct {
 func NewDomainMonitoredConn(conn transport.StreamConn, domain string, domainStats *DomainTrafficStats) *DomainMonitoredConn {
 	// 为全局统计创建监控连接
 	globalConn := httpproxy.NewMonitoredConn(conn, domainStats.GetGlobalStats())
-	
+
 	return &DomainMonitoredConn{
 		StreamConn:  conn,
 		domain:      domain,
@@ -283,16 +285,24 @@ func (c *tcpStreamConn) CloseWrite() error {
 	return nil
 }
 
-// matchWildcard 检查目标字符串是否匹配给定的通配符模式
-func matchWildcard(pattern, target string) bool {
-	if pattern == "*" {
-		return true
+// matchDomain 检查目标域名是否匹配给定的域名规则
+func matchDomain(rule, host string) bool {
+
+	// 统一使用以 . 开头的匹配规则
+	// 如果规则不是以 . 开头，则添加 .
+	var domain string
+	var dotRule string
+
+	if strings.HasPrefix(rule, ".") {
+		domain = rule[1:] // 去掉开头的 .
+		dotRule = rule
+	} else {
+		domain = rule
+		dotRule = "." + rule
 	}
-	if strings.HasPrefix(pattern, "*.") {
-		suffix := pattern[2:]
-		return strings.HasSuffix(target, suffix) || target == suffix
-	}
-	return pattern == target
+
+	// 匹配该域名及其所有子域名
+	return host == domain || strings.HasSuffix(host, dotRule)
 }
 
 // isWhitelisted 检查域名是否在白名单中，支持通配符匹配
@@ -302,9 +312,9 @@ func (d *WhitelistDialer) isWhitelisted(host string) bool {
 		return true
 	}
 
-	// 检查是否匹配白名单中的通配符规则
-	for pattern := range d.whitelist {
-		if matchWildcard(pattern, host) {
+	// 检查是否匹配白名单中的规则
+	for rule := range d.whitelist {
+		if matchDomain(rule, host) {
 			return true
 		}
 	}
@@ -324,9 +334,9 @@ func (d *WhitelistDialer) shouldMonitor(host string) bool {
 		return true
 	}
 
-	// 检查是否匹配监控列表中的通配符规则
-	for pattern := range d.monitorDomains {
-		if matchWildcard(pattern, host) {
+	// 检查是否匹配监控列表中的规则
+	for rule := range d.monitorDomains {
+		if matchDomain(rule, host) {
 			return true
 		}
 	}
@@ -334,12 +344,222 @@ func (d *WhitelistDialer) shouldMonitor(host string) bool {
 	return false
 }
 
+// SOCKS5ProxyServer 实现一个简单的SOCKS5代理服务器
+type SOCKS5ProxyServer struct {
+	dialer transport.StreamDialer
+}
+
+// NewSOCKS5ProxyServer 创建一个新的SOCKS5代理服务器
+func NewSOCKS5ProxyServer(dialer transport.StreamDialer) *SOCKS5ProxyServer {
+	return &SOCKS5ProxyServer{dialer: dialer}
+}
+
+// handleConnection 处理单个SOCKS5连接
+func (s *SOCKS5ProxyServer) handleConnection(clientConn net.Conn) {
+	defer clientConn.Close()
+
+	// SOCKS5握手
+	if err := s.performHandshake(clientConn); err != nil {
+		log.Printf("SOCKS5 握手失败: %v", err)
+		return
+	}
+
+	// 处理连接请求
+	targetAddr, err := s.handleConnectRequest(clientConn)
+	if err != nil {
+		log.Printf("SOCKS5 连接请求处理失败: %v", err)
+		return
+	}
+
+	// 建立到目标地址的连接
+	targetConn, err := s.dialer.DialStream(context.Background(), targetAddr)
+	if err != nil {
+		log.Printf("连接到目标地址失败 %s: %v", targetAddr, err)
+		// 发送连接失败响应
+		s.sendConnectResponse(clientConn, 0x05) // Connection refused
+		return
+	}
+	defer targetConn.Close()
+
+	// 发送连接成功响应
+	if err := s.sendConnectResponse(clientConn, 0x00); err != nil {
+		log.Printf("发送连接响应失败: %v", err)
+		return
+	}
+
+	log.Printf("SOCKS5 代理连接建立: %s", targetAddr)
+
+	// 开始双向数据转发
+	s.relayData(clientConn, targetConn)
+}
+
+// performHandshake 执行SOCKS5握手
+func (s *SOCKS5ProxyServer) performHandshake(conn net.Conn) error {
+	// 读取客户端hello消息
+	buf := make([]byte, 256)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return fmt.Errorf("读取握手消息失败: %w", err)
+	}
+
+	if n < 3 || buf[0] != 0x05 {
+		return fmt.Errorf("无效的SOCKS版本")
+	}
+
+	// 响应：选择无认证方法
+	_, err = conn.Write([]byte{0x05, 0x00}) // VER=5, METHOD=0 (no auth)
+	return err
+}
+
+// handleConnectRequest 处理连接请求
+func (s *SOCKS5ProxyServer) handleConnectRequest(conn net.Conn) (string, error) {
+	buf := make([]byte, 256)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return "", fmt.Errorf("读取连接请求失败: %w", err)
+	}
+
+	if n < 7 || buf[0] != 0x05 || buf[1] != 0x01 {
+		return "", fmt.Errorf("无效的连接请求")
+	}
+
+	// 解析目标地址
+	var targetAddr string
+	addrType := buf[3]
+
+	switch addrType {
+	case 0x01: // IPv4
+		if n < 10 {
+			return "", fmt.Errorf("IPv4地址数据不完整")
+		}
+		ip := net.IP(buf[4:8])
+		port := binary.BigEndian.Uint16(buf[8:10])
+		targetAddr = fmt.Sprintf("%s:%d", ip.String(), port)
+
+	case 0x03: // Domain name
+		if n < 7 {
+			return "", fmt.Errorf("域名地址数据不完整")
+		}
+		domainLen := int(buf[4])
+		if n < 7+domainLen {
+			return "", fmt.Errorf("域名数据不完整")
+		}
+		domain := string(buf[5 : 5+domainLen])
+		port := binary.BigEndian.Uint16(buf[5+domainLen : 7+domainLen])
+		targetAddr = fmt.Sprintf("%s:%d", domain, port)
+
+	case 0x04: // IPv6
+		if n < 22 {
+			return "", fmt.Errorf("IPv6地址数据不完整")
+		}
+		ip := net.IP(buf[4:20])
+		port := binary.BigEndian.Uint16(buf[20:22])
+		targetAddr = fmt.Sprintf("[%s]:%d", ip.String(), port)
+
+	default:
+		return "", fmt.Errorf("不支持的地址类型: %d", addrType)
+	}
+
+	return targetAddr, nil
+}
+
+// sendConnectResponse 发送连接响应
+func (s *SOCKS5ProxyServer) sendConnectResponse(conn net.Conn, replyCode byte) error {
+	// 简单的响应：VER=5, REP=replyCode, RSV=0, ATYP=1, BND.ADDR=0.0.0.0, BND.PORT=0
+	response := []byte{0x05, replyCode, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	_, err := conn.Write(response)
+	return err
+}
+
+// relayData 在客户端和目标服务器之间转发数据
+func (s *SOCKS5ProxyServer) relayData(clientConn net.Conn, targetConn transport.StreamConn) {
+	done := make(chan struct{}, 2)
+
+	// 客户端 -> 目标服务器
+	go func() {
+		defer func() { done <- struct{}{} }()
+		io.Copy(targetConn, clientConn)
+		targetConn.CloseWrite()
+	}()
+
+	// 目标服务器 -> 客户端
+	go func() {
+		defer func() { done <- struct{}{} }()
+		io.Copy(clientConn, targetConn)
+		if tcpConn, ok := clientConn.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		}
+	}()
+
+	// 等待任一方向的传输结束
+	<-done
+}
+
+// startSOCKS5Server 启动SOCKS5代理服务器
+func startSOCKS5Server(address string, dialer transport.StreamDialer) {
+	server := NewSOCKS5ProxyServer(dialer)
+
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		log.Fatalf("SOCKS5服务器监听失败 %s: %v", address, err)
+	}
+	defer listener.Close()
+
+	log.Printf("SOCKS5代理服务器监听在 %s", listener.Addr().String())
+
+	for {
+		clientConn, err := listener.Accept()
+		if err != nil {
+			log.Printf("接受SOCKS5连接失败: %v", err)
+			continue
+		}
+
+		go server.handleConnection(clientConn)
+	}
+}
+
 func main() {
 	transportFlag := flag.String("transport", "", "Transport config")
 	addrFlag := flag.String("localAddr", "localhost:1080", "Local proxy address")
 	urlProxyPrefixFlag := flag.String("urlProxyPrefix", "/proxy", "Path where to run the URL proxy. Set to empty (\"\") to disable it.")
-	whitelistFlag := flag.String("whitelist", "", "Comma-separated list of domains to bypass proxy")
+	whitelistFileFlag := flag.String("whitelist-file", "", "Path to file containing domains to bypass proxy (one per line)")
 	monitorDomainsFlag := flag.String("monitorDomains", "", "Comma-separated list of domains to monitor traffic for (empty = monitor all)")
+	socketPortFlag := flag.String("socket-port", "", "Port to run SOCKS5 proxy on (e.g., '1082')")
+
+	// 自定义 help 信息
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "HTTP2Transport - HTTP和SOCKS5代理服务器\n\n")
+		fmt.Fprintf(os.Stderr, "用法:\n")
+		fmt.Fprintf(os.Stderr, "  %s [选项]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "选项:\n")
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\n示例:\n")
+		fmt.Fprintf(os.Stderr, "  # 基本用法 - 启动HTTP代理\n")
+		fmt.Fprintf(os.Stderr, "  KEY=ss://ENCRYPTION_KEY@HOST:PORT/\n")
+		fmt.Fprintf(os.Stderr, "  %s -transport \"$KEY\" -localAddr 0.0.0.0:1080\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  # 同时启动HTTP和SOCKS5代理\n")
+		fmt.Fprintf(os.Stderr, "  %s -transport \"$KEY\" -localAddr 0.0.0.0:1080 -socket-port 1082\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  # 使用白名单文件\n")
+		fmt.Fprintf(os.Stderr, "  echo -e \"265.com\\n.zzxworld.com\" > whitelist.txt\n")
+		fmt.Fprintf(os.Stderr, "  %s -transport \"$KEY\" -whitelist-file whitelist.txt\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  # 监控特定域名流量\n")
+		fmt.Fprintf(os.Stderr, "  %s -transport \"$KEY\" -monitorDomains \"api.anthropic.com,*.openai.com\"\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  # 完整示例\n")
+		fmt.Fprintf(os.Stderr, "  %s -transport \"$KEY\" \\\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "    -localAddr 0.0.0.0:1080 \\\n")
+		fmt.Fprintf(os.Stderr, "    -socket-port 1082 \\\n")
+		fmt.Fprintf(os.Stderr, "    -whitelist-file whitelist.txt \\\n")
+		fmt.Fprintf(os.Stderr, "    -monitorDomains \"api.anthropic.com,*.openai.com\"\n\n")
+		fmt.Fprintf(os.Stderr, "白名单文件格式:\n")
+		fmt.Fprintf(os.Stderr, "  265.com          # 完全匹配\n")
+		fmt.Fprintf(os.Stderr, "  .zzxworld.com    # 匹配该域名及其所有子域名\n")
+		fmt.Fprintf(os.Stderr, "  # 注释行\n\n")
+		fmt.Fprintf(os.Stderr, "服务端点:\n")
+		fmt.Fprintf(os.Stderr, "  HTTP代理:   http://localhost:1080\n")
+		fmt.Fprintf(os.Stderr, "  SOCKS5代理: socks5://localhost:1082 (如果启用)\n")
+		fmt.Fprintf(os.Stderr, "  统计接口:   http://localhost:1080/stats\n")
+	}
+
 	flag.Parse()
 
 	// 创建原始拨号器
@@ -348,11 +568,21 @@ func main() {
 		log.Fatalf("Could not create dialer: %v", err)
 	}
 
-	// 解析白名单域名
+	// 从文件读取白名单域名
 	var whitelistDomains []string
-	if *whitelistFlag != "" {
-		whitelistDomains = strings.Split(*whitelistFlag, ",")
-		log.Printf("域名白名单: %v", whitelistDomains)
+	if *whitelistFileFlag != "" {
+		content, err := os.ReadFile(*whitelistFileFlag)
+		if err != nil {
+			log.Fatalf("无法读取白名单文件 %s: %v", *whitelistFileFlag, err)
+		}
+		lines := strings.Split(string(content), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line != "" && !strings.HasPrefix(line, "#") {
+				whitelistDomains = append(whitelistDomains, line)
+			}
+		}
+		log.Printf("从文件 %s 读取到 %d 个白名单域名", *whitelistFileFlag, len(whitelistDomains))
 	}
 
 	// 解析监控域名
@@ -367,6 +597,12 @@ func main() {
 
 	// 创建带白名单的拨号器
 	dialer := NewWhitelistDialer(baseDialer, whitelistDomains, monitorDomains, domainStats)
+
+	// 如果指定了SOCKS5端口，启动SOCKS5代理服务器
+	if *socketPortFlag != "" {
+		socketAddr := fmt.Sprintf("localhost:%s", *socketPortFlag)
+		go startSOCKS5Server(socketAddr, dialer)
+	}
 
 	listener, err := net.Listen("tcp", *addrFlag)
 	if err != nil {
@@ -389,28 +625,28 @@ func main() {
 			w.WriteHeader(http.StatusOK)
 			globalStats := domainStats.GetGlobalStats()
 			allDomainStats := domainStats.GetAllDomainStats()
-			
+
 			// 构建完整的统计响应
-			response := map[string]interface{}{
-				"uploadBytes":             formatBytes(globalStats.GetUploadBytes()),
-				"downloadBytes":           formatBytes(globalStats.GetDownloadBytes()),
-				"outlineConnectionTime":   formatDuration(globalStats.GetCurrentSessionDuration()),
-				"currentSessionDuration":  formatDuration(globalStats.GetCurrentSessionDuration()),
-				"activeConnections":       globalStats.GetActiveConnections(),
-				"totalConnections":        globalStats.GetTotalConnections(),
-				"monitoredDomains":        allDomainStats,
+			response := map[string]any{
+				"uploadBytes":            formatBytes(globalStats.GetUploadBytes()),
+				"downloadBytes":          formatBytes(globalStats.GetDownloadBytes()),
+				"outlineConnectionTime":  formatDuration(globalStats.GetCurrentSessionDuration()),
+				"currentSessionDuration": formatDuration(globalStats.GetCurrentSessionDuration()),
+				"activeConnections":      globalStats.GetActiveConnections(),
+				"totalConnections":       globalStats.GetTotalConnections(),
+				"monitoredDomains":       allDomainStats,
 			}
-			
+
 			jsonData, err := json.MarshalIndent(response, "", "  ")
 			if err != nil {
 				http.Error(w, "Failed to marshal JSON", http.StatusInternalServerError)
 				return
 			}
-			
+
 			w.Write(jsonData)
 			return
 		}
-		
+
 		// 其他所有请求交给代理handler处理（包括CONNECT方法）
 		proxyHandler.ServeHTTP(w, r)
 	})

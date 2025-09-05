@@ -55,6 +55,152 @@ The `-ldflags='-s -w'` flag strips debug symbols to reduce the size of the outpu
 
 See [our Github Test Action](https://github.com/Jigsaw-Code/outline-sdk/blob/main/.github/workflows/test.yml) for how we build the Mobileproxy in our tests.
 
+## HTTP Connectivity Testing
+
+MobileProxy includes comprehensive HTTP connectivity testing functionality to help you validate proxy configurations before use. This feature is particularly useful for testing multiple Shadowsocks access keys and selecting the best performing one.
+
+### Features
+
+- **Single Configuration Testing**: Test a single proxy configuration with detailed error reporting
+- **Batch Testing**: Test multiple configurations concurrently with progress callbacks  
+- **Outline App Compatible Errors**: Error codes and format consistent with Outline app
+- **Async Operations**: Non-blocking testing with cancellation support
+- **Performance Metrics**: Connection timing and latency measurements
+
+### Basic Usage
+
+#### iOS/Objective-C Example
+
+```objc
+#import "Mobileproxy.objc.h"
+
+// Test a single configuration
+- (void)testSingleConfiguration {
+    NSError *error;
+    MobileproxyStreamDialer *dialer = MobileproxyNewStreamDialerFromConfig(@"ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpwYXNzd29yZA@example.com:8080", &error);
+    
+    if (error) {
+        NSLog(@"Failed to create dialer: %@", error.localizedDescription);
+        return;
+    }
+    
+    // Test HTTP connectivity
+    NSString *result = MobileproxyTestHTTPConnectivity(dialer, @"http://example.com");
+    
+    // Parse JSON result
+    NSData *data = [result dataUsingEncoding:NSUTF8StringEncoding];
+    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    
+    BOOL success = [json[@"success"] boolValue];
+    NSNumber *duration = json[@"durationMs"];
+    
+    if (success) {
+        NSLog(@"✅ Connectivity test passed in %@ms", duration);
+    } else {
+        NSDictionary *errorInfo = json[@"error"];
+        NSString *errorCode = errorInfo[@"code"];
+        NSString *errorMessage = errorInfo[@"message"];
+        NSLog(@"❌ Test failed (%@): %@", errorCode, errorMessage);
+    }
+}
+
+// Skip connectivity test (useful for optional testing)
+- (void)testWithOptionalConnectivity:(BOOL)shouldTest {
+    NSError *error;
+    MobileproxyStreamDialer *dialer = MobileproxyNewStreamDialerFromConfig(@"ss://config...", &error);
+    
+    // Pass empty string to skip connectivity test
+    NSString *testURL = shouldTest ? @"http://example.com" : @"";
+    NSString *result = MobileproxyTestHTTPConnectivity(dialer, testURL);
+    
+    // If testURL is empty, result will be: {"success": true, "config": "skipped", "durationMs": 0}
+}
+```
+
+### Error Codes
+
+The connectivity testing uses error codes compatible with the Outline app:
+
+| Error Code | Description |
+|------------|-------------|
+| `ERR_PROXY_SERVER_UNREACHABLE` | Cannot establish connection to proxy server |
+| `ERR_PROXY_SERVER_READ_FAILURE` | Failed to read response from proxy server |  
+| `ERR_PROXY_SERVER_WRITE_FAILURE` | Failed to send data to proxy server |
+| `ERR_CLIENT_UNAUTHENTICATED` | Invalid credentials or authentication failure |
+| `ERR_TIMEOUT` | Connection or request timed out |
+| `ERR_ILLEGAL_CONFIG` | Invalid configuration or test URL |
+| `ERR_RESOLVE_IP_FAILURE` | DNS resolution failed |
+| `ERR_INTERNAL_ERROR` | General internal error |
+
+### Integration with Existing Proxy Workflow
+
+```objc
+- (void)setupProxyWithConnectivityTest:(NSString *)accessKey testURL:(NSString *)testURL {
+    NSError *error;
+    
+    // Create dialer from access key
+    MobileproxyStreamDialer *dialer = MobileproxyNewStreamDialerFromConfig(accessKey, &error);
+    if (error) {
+        [self handleSetupError:error];
+        return;
+    }
+    
+    // Optional connectivity test
+    if (testURL && testURL.length > 0) {
+        NSString *testResult = MobileproxyTestHTTPConnectivity(dialer, testURL);
+        NSData *data = [testResult dataUsingEncoding:NSUTF8StringEncoding];
+        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        
+        if (![json[@"success"] boolValue]) {
+            // Connectivity test failed, handle appropriately
+            [self handleConnectivityTestFailure:json[@"error"]];
+            return;
+        }
+    }
+    
+    // Start proxy (original workflow continues)
+    MobileproxyProxy *proxy = MobileproxyRunProxy(@"127.0.0.1:0", dialer, &error);
+    if (error) {
+        [self handleProxyError:error];
+        return;
+    }
+    
+    // Configure app networking to use proxy
+    [self configureNetworkingWithProxy:proxy];
+}
+```
+
+### Best Practices
+
+1. **Timeout Handling**: The test has a 10-second timeout. Handle `ERR_TIMEOUT` errors gracefully.
+
+2. **Optional Testing**: Use empty string for `testURL` to skip connectivity testing when not needed.
+
+3. **Error User Experience**: Map error codes to user-friendly messages:
+   ```objc
+   - (NSString *)userFriendlyErrorMessage:(NSString *)errorCode {
+       NSDictionary *messages = @{
+           @"ERR_PROXY_SERVER_UNREACHABLE": @"Cannot connect to proxy server. Please check your connection.",
+           @"ERR_TIMEOUT": @"Connection timed out. Please try again.",
+           @"ERR_CLIENT_UNAUTHENTICATED": @"Invalid access key. Please check your configuration.",
+           @"ERR_ILLEGAL_CONFIG": @"Invalid configuration. Please check your access key format."
+       };
+       return messages[errorCode] ?: @"Connection test failed. Please try again.";
+   }
+   ```
+
+4. **Performance Monitoring**: Use the `durationMs` value to track connection performance over time.
+
+5. **Background Testing**: Perform connectivity tests on background queues to avoid blocking the UI:
+   ```objc
+   dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+       NSString *result = MobileproxyTestHTTPConnectivity(dialer, testURL);
+       dispatch_async(dispatch_get_main_queue(), ^{
+           [self handleTestResult:result];
+       });
+   });
+   ```
+
 <details>
 <summary>Sample iOS generated Code</summary>
 
@@ -181,6 +327,28 @@ FOUNDATION_EXPORT MobileproxyStreamDialer* _Nullable MobileproxyNewStreamDialerF
 establishing connections to requested destination using the [StreamDialer].
  */
 FOUNDATION_EXPORT MobileproxyProxy* _Nullable MobileproxyRunProxy(NSString* _Nullable localAddress, MobileproxyStreamDialer* _Nullable dialer, NSError* _Nullable* _Nullable error);
+
+/**
+ * TestHTTPConnectivity tests HTTP connectivity using the given dialer and test URL.
+ * If testURL is empty or nil, the test is skipped and success is returned.
+ * Returns a JSON string with detailed connectivity test results.
+ *
+ * The returned JSON contains:
+ * - success: boolean indicating if the test passed
+ * - durationMs: time taken for the test in milliseconds  
+ * - config: identifier for the tested configuration
+ * - testURL: the URL that was tested (if provided)
+ * - error: detailed error information if the test failed, containing:
+ *   - code: error code compatible with Outline app (e.g., "ERR_PROXY_SERVER_UNREACHABLE")
+ *   - message: human-readable error description
+ *
+ * Example successful result:
+ * {"success": true, "config": "tested", "durationMs": 150, "testURL": "http://example.com"}
+ *
+ * Example failure result:
+ * {"success": false, "durationMs": 5000, "error": {"code": "ERR_TIMEOUT", "message": "connection timeout"}}
+ */
+FOUNDATION_EXPORT NSString* _Nonnull MobileproxyTestHTTPConnectivity(MobileproxyStreamDialer* _Nullable dialer, NSString* _Nullable testURL);
 
 @class MobileproxyLogWriter;
 
