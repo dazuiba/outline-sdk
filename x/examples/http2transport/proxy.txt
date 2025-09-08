@@ -1,0 +1,7 @@
+.chatgpt.com
+.openai.com
+.gstatic.com
+.oaistatic.com
+.googleusercontent.com
+.googleapis.com
+.google.com
