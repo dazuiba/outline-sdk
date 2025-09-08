@@ -41,15 +41,15 @@ func TestMatchDomain(t *testing.T) {
 	}
 }
 
-func TestIsWhitelisted(t *testing.T) {
+func TestIsDirectHost(t *testing.T) {
 	// 创建测试拨号器
 	mockDialer := &mockStreamDialer{}
 
 	// 测试规则：基于你提供的示例
-	whitelistDomains := []string{"a.com", ".a.com", "265.com", ".zzxworld.com"}
-	monitorDomains := []string{}
+    directDomains := []string{"a.com", ".a.com", "265.com", ".zzxworld.com"}
+    monitorDomains := []string{}
 
-	dialer := NewWhitelistDialer(mockDialer, whitelistDomains, monitorDomains, nil)
+    dialer := NewWhitelistDialer(mockDialer, directDomains, nil, "proxy", monitorDomains, nil)
 
 	testCases := []struct {
 		host     string
@@ -57,34 +57,34 @@ func TestIsWhitelisted(t *testing.T) {
 		desc     string
 	}{
 		// 基于你的JS测试用例
-		{"www.a.com", true, "www.a.com should be whitelisted"},
-		{"aa.com", false, "aa.com should not be whitelisted"},
-		{"a.com", true, "a.com should be whitelisted"},
+        {"www.a.com", true, "www.a.com should be direct"},
+        {"aa.com", false, "aa.com should not be direct"},
+        {"a.com", true, "a.com should be direct"},
 
 		// 测试 265.com
-		{"265.com", true, "265.com should be whitelisted"},
-		{"sub.265.com", true, "sub.265.com should be whitelisted"},
+        {"265.com", true, "265.com should be direct"},
+        {"sub.265.com", true, "sub.265.com should be direct"},
 
 		// 测试 .zzxworld.com 格式
-		{"zzxworld.com", true, "zzxworld.com should be whitelisted"},
-		{"www.zzxworld.com", true, "www.zzxworld.com should be whitelisted"},
-		{"api.zzxworld.com", true, "api.zzxworld.com should be whitelisted"},
-		{"sub.sub.zzxworld.com", true, "nested subdomain should be whitelisted"},
+        {"zzxworld.com", true, "zzxworld.com should be direct"},
+        {"www.zzxworld.com", true, "www.zzxworld.com should be direct"},
+        {"api.zzxworld.com", true, "api.zzxworld.com should be direct"},
+        {"sub.sub.zzxworld.com", true, "nested subdomain should be direct"},
 
 		// 不应该匹配的域名
-		{"notwhitelisted.com", false, "notwhitelisted.com should not be whitelisted"},
-		{"zzxworld.com.evil.com", false, "domain with suffix should not be whitelisted"},
-		{"265.com.evil.com", false, "265.com with suffix should not be whitelisted"},
+        {"notwhitelisted.com", false, "notwhitelisted.com should not be direct"},
+        {"zzxworld.com.evil.com", false, "domain with suffix should not be direct"},
+        {"265.com.evil.com", false, "265.com with suffix should not be direct"},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
-			result := dialer.isWhitelisted(tc.host)
-			if result != tc.expected {
-				t.Errorf("isWhitelisted(%q) = %v, expected %v", tc.host, result, tc.expected)
-			}
-		})
-	}
+            result := dialer.isDirectHost(tc.host)
+            if result != tc.expected {
+                t.Errorf("isDirectHost(%q) = %v, expected %v", tc.host, result, tc.expected)
+            }
+        })
+    }
 }
 
 func TestShouldMonitor(t *testing.T) {
@@ -92,10 +92,10 @@ func TestShouldMonitor(t *testing.T) {
 	mockDialer := &mockStreamDialer{}
 
 	// 测试监控规则
-	whitelistDomains := []string{}
-	monitorDomains := []string{"api.anthropic.com", "*.openai.com"}
+    directDomains := []string{}
+    monitorDomains := []string{"api.anthropic.com", "*.openai.com"}
 
-	dialer := NewWhitelistDialer(mockDialer, whitelistDomains, monitorDomains, nil)
+    dialer := NewWhitelistDialer(mockDialer, directDomains, nil, "proxy", monitorDomains, nil)
 
 	testCases := []struct {
 		host     string
@@ -123,10 +123,10 @@ func TestShouldMonitor(t *testing.T) {
 func TestShouldMonitorEmptyList(t *testing.T) {
 	// 测试空监控列表的情况（应该监控所有域名）
 	mockDialer := &mockStreamDialer{}
-	whitelistDomains := []string{}
-	monitorDomains := []string{} // 空列表
+    directDomains := []string{}
+    monitorDomains := []string{} // 空列表
 
-	dialer := NewWhitelistDialer(mockDialer, whitelistDomains, monitorDomains, nil)
+    dialer := NewWhitelistDialer(mockDialer, directDomains, nil, "proxy", monitorDomains, nil)
 
 	testCases := []string{"api.anthropic.com", "google.com", "example.com"}
 

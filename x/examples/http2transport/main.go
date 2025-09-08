@@ -85,16 +85,22 @@ type DomainStats struct {
 
 // DomainTrafficStats 管理按域名分组的流量统计
 type DomainTrafficStats struct {
-	mu          sync.RWMutex
-	domainStats map[string]*DomainStats
-	globalStats *httpproxy.TrafficStats
+	mu               sync.RWMutex
+	domainStats      map[string]*DomainStats
+	globalStats      *httpproxy.TrafficStats
+	mainProxyStats   *httpproxy.TrafficStats
+	secondProxyStats *httpproxy.TrafficStats
+	directStats      *httpproxy.TrafficStats
 }
 
 // NewDomainTrafficStats 创建新的域名流量统计实例
 func NewDomainTrafficStats() *DomainTrafficStats {
 	return &DomainTrafficStats{
-		domainStats: make(map[string]*DomainStats),
-		globalStats: httpproxy.NewTrafficStats(),
+		domainStats:      make(map[string]*DomainStats),
+		globalStats:      httpproxy.NewTrafficStats(),
+		mainProxyStats:   httpproxy.NewTrafficStats(),
+		secondProxyStats: httpproxy.NewTrafficStats(),
+		directStats:      httpproxy.NewTrafficStats(),
 	}
 }
 
@@ -148,31 +154,66 @@ func (dts *DomainTrafficStats) GetGlobalStats() *httpproxy.TrafficStats {
 	return dts.globalStats
 }
 
+// GetMainProxyStats 获取主代理流量统计
+func (dts *DomainTrafficStats) GetMainProxyStats() *httpproxy.TrafficStats {
+	return dts.mainProxyStats
+}
+
+// GetSecondProxyStats 获取备用代理流量统计
+func (dts *DomainTrafficStats) GetSecondProxyStats() *httpproxy.TrafficStats {
+	return dts.secondProxyStats
+}
+
+// GetDirectStats 获取直连流量统计
+func (dts *DomainTrafficStats) GetDirectStats() *httpproxy.TrafficStats {
+	return dts.directStats
+}
+
 // DomainMonitoredConn 带域名跟踪的连接包装器
 type DomainMonitoredConn struct {
 	transport.StreamConn
 	domain      string
 	domainStats *DomainTrafficStats
 	globalConn  transport.StreamConn // 用于全局统计的连接
+	typeConn    transport.StreamConn // 用于类型统计的连接(main-proxy/second-proxy/direct)
+	connType    string               // 连接类型：main-proxy, second-proxy, direct
 }
 
 // NewDomainMonitoredConn 创建带域名跟踪的连接
-func NewDomainMonitoredConn(conn transport.StreamConn, domain string, domainStats *DomainTrafficStats) *DomainMonitoredConn {
+func NewDomainMonitoredConn(conn transport.StreamConn, domain string, domainStats *DomainTrafficStats, connType string) *DomainMonitoredConn {
 	// 为全局统计创建监控连接
 	globalConn := httpproxy.NewMonitoredConn(conn, domainStats.GetGlobalStats())
+
+	// 根据连接类型创建相应的统计连接
+	var typeConn transport.StreamConn
+	switch connType {
+	case "main-proxy":
+		typeConn = httpproxy.NewMonitoredConn(conn, domainStats.GetMainProxyStats())
+	case "second-proxy":
+		typeConn = httpproxy.NewMonitoredConn(conn, domainStats.GetSecondProxyStats())
+	case "direct":
+		typeConn = httpproxy.NewMonitoredConn(conn, domainStats.GetDirectStats())
+	default:
+		// 默认使用主代理统计
+		typeConn = httpproxy.NewMonitoredConn(conn, domainStats.GetMainProxyStats())
+	}
 
 	return &DomainMonitoredConn{
 		StreamConn:  conn,
 		domain:      domain,
 		domainStats: domainStats,
 		globalConn:  globalConn,
+		typeConn:    typeConn,
+		connType:    connType,
 	}
 }
 
 // Read 重写读取方法以跟踪下载流量
 func (dmc *DomainMonitoredConn) Read(b []byte) (int, error) {
-	n, err := dmc.globalConn.Read(b)
+	n, err := dmc.typeConn.Read(b)
 	if n > 0 {
+		// 同时更新全局统计和域名统计
+		dmc.globalConn.Read(make([]byte, 0)) // 触发全局统计更新
 		dmc.domainStats.AddTraffic(dmc.domain, 0, int64(n))
 	}
 	return n, err
@@ -180,8 +221,10 @@ func (dmc *DomainMonitoredConn) Read(b []byte) (int, error) {
 
 // Write 重写写入方法以跟踪上传流量
 func (dmc *DomainMonitoredConn) Write(b []byte) (int, error) {
-	n, err := dmc.globalConn.Write(b)
+	n, err := dmc.typeConn.Write(b)
 	if n > 0 {
+		// 同时更新全局统计和域名统计
+		dmc.globalConn.Write(make([]byte, 0)) // 触发全局统计更新
 		dmc.domainStats.AddTraffic(dmc.domain, int64(n), 0)
 	}
 	return n, err
@@ -189,38 +232,59 @@ func (dmc *DomainMonitoredConn) Write(b []byte) (int, error) {
 
 // Close 重写关闭方法
 func (dmc *DomainMonitoredConn) Close() error {
-	return dmc.globalConn.Close()
+	// 关闭两个连接
+	dmc.globalConn.Close()
+	return dmc.typeConn.Close()
 }
 
-// WhitelistDialer 实现了一个带有域名白名单的拨号器
+// WhitelistDialer 实现了一个带有直连/代理名单并支持默认策略的拨号器
 type WhitelistDialer struct {
-	// 原始拨号器，用于通过shadowsocks代理连接
-	proxyDialer transport.StreamDialer
-	// 域名白名单
-	whitelist map[string]bool
+	// 主代理拨号器
+	mainProxyDialer transport.StreamDialer
+	// 备用代理拨号器
+	secondProxyDialer transport.StreamDialer
+	// 直连域名名单（命中则直连）
+	directList map[string]bool
+	// 主代理域名名单（命中则走主代理）
+	mainProxyList map[string]bool
+	// 备用代理域名名单（命中则走备用代理）
+	secondProxyList map[string]bool
 	// 域名流量统计
 	domainStats *DomainTrafficStats
-	// 监控域名列表
-	monitorDomains map[string]bool
+	// 默认策略："direct"、"main-proxy" 或 "second-proxy"
+	defaultBehavior string
 }
 
 // NewWhitelistDialer 创建一个新的WhitelistDialer
-func NewWhitelistDialer(proxyDialer transport.StreamDialer, whitelistDomains []string, monitorDomains []string, domainStats *DomainTrafficStats) *WhitelistDialer {
-	whitelist := make(map[string]bool)
-	for _, domain := range whitelistDomains {
-		whitelist[domain] = true
+func NewWhitelistDialer(mainProxyDialer, secondProxyDialer transport.StreamDialer, directDomains []string, mainProxyDomains []string, secondProxyDomains []string, defaultBehavior string, domainStats *DomainTrafficStats) *WhitelistDialer {
+	direct := make(map[string]bool)
+	for _, domain := range directDomains {
+		direct[domain] = true
 	}
 
-	monitorDomainsMap := make(map[string]bool)
-	for _, domain := range monitorDomains {
-		monitorDomainsMap[domain] = true
+	mainProxy := make(map[string]bool)
+	for _, domain := range mainProxyDomains {
+		mainProxy[domain] = true
+	}
+
+	secondProxy := make(map[string]bool)
+	for _, domain := range secondProxyDomains {
+		secondProxy[domain] = true
+	}
+
+	// 验证默认策略：只允许 "direct"、"main-proxy" 或 "second-proxy"
+	if defaultBehavior != "direct" && defaultBehavior != "main-proxy" && defaultBehavior != "second-proxy" {
+		defaultBehavior = "main-proxy"
 	}
 
 	return &WhitelistDialer{
-		proxyDialer:    proxyDialer,
-		whitelist:      whitelist,
-		domainStats:    domainStats,
-		monitorDomains: monitorDomainsMap,
+		mainProxyDialer:   mainProxyDialer,
+		secondProxyDialer: secondProxyDialer,
+		directList:        direct,
+		mainProxyList:     mainProxy,
+		secondProxyList:   secondProxy,
+		domainStats:       domainStats,
+		defaultBehavior:   defaultBehavior,
 	}
 }
 
@@ -232,36 +296,97 @@ func (d *WhitelistDialer) DialStream(ctx context.Context, address string) (trans
 		return nil, err
 	}
 
-	// 检查是否应该监控这个域名
-	shouldMonitorDomain := d.shouldMonitor(host)
-
-	// 检查域名是否在白名单中
-	if d.isWhitelisted(host) {
+	// 检查域名是否在直连名单中
+	if d.isDirectHost(host) {
 		log.Printf("使用直连连接 %s", address)
 		netDialer := &net.Dialer{}
 		conn, err := netDialer.DialContext(ctx, "tcp", address)
 		if err != nil {
 			return nil, err
 		}
-		// 将net.Conn转换为transport.StreamConn并根据域名监控设置包装监控
+		// 将net.Conn转换为transport.StreamConn并添加监控
 		wrappedConn := &tcpStreamConn{Conn: conn}
-		if d.domainStats != nil && shouldMonitorDomain {
-			return NewDomainMonitoredConn(wrappedConn, host, d.domainStats), nil
+		if d.domainStats != nil {
+			return NewDomainMonitoredConn(wrappedConn, host, d.domainStats, "direct"), nil
 		}
 		return wrappedConn, nil
 	}
 
-	// 不在白名单中，使用代理连接
-	log.Printf("使用代理连接 %s", address)
-	conn, err := d.proxyDialer.DialStream(ctx, address)
-	if err != nil {
-		return nil, err
+	// 检查是否在主代理名单中
+	if d.isMainProxyHost(host) {
+		log.Printf("使用主代理连接 %s", address)
+		conn, err := d.mainProxyDialer.DialStream(ctx, address)
+		if err != nil {
+			return nil, err
+		}
+		if d.domainStats != nil {
+			return NewDomainMonitoredConn(conn, host, d.domainStats, "main-proxy"), nil
+		}
+		return conn, nil
 	}
-	// 为代理连接也根据域名监控设置添加监控
-	if d.domainStats != nil && shouldMonitorDomain {
-		return NewDomainMonitoredConn(conn, host, d.domainStats), nil
+
+	// 检查是否在备用代理名单中
+	if d.isSecondProxyHost(host) {
+		log.Printf("使用备用代理连接 %s", address)
+		conn, err := d.secondProxyDialer.DialStream(ctx, address)
+		if err != nil {
+			return nil, err
+		}
+		if d.domainStats != nil {
+			return NewDomainMonitoredConn(conn, host, d.domainStats, "second-proxy"), nil
+		}
+		return conn, nil
 	}
-	return conn, nil
+
+	// 都不在名单中，按默认策略处理
+	switch d.defaultBehavior {
+	case "direct":
+		log.Printf("使用直连连接 %s (默认策略)", address)
+		netDialer := &net.Dialer{}
+		directConn, err := netDialer.DialContext(ctx, "tcp", address)
+		if err != nil {
+			return nil, err
+		}
+		wrappedConn := &tcpStreamConn{Conn: directConn}
+		if d.domainStats != nil {
+			return NewDomainMonitoredConn(wrappedConn, host, d.domainStats, "direct"), nil
+		}
+		return wrappedConn, nil
+
+	case "main-proxy":
+		log.Printf("使用主代理连接 %s (默认策略)", address)
+		conn, err := d.mainProxyDialer.DialStream(ctx, address)
+		if err != nil {
+			return nil, err
+		}
+		if d.domainStats != nil {
+			return NewDomainMonitoredConn(conn, host, d.domainStats, "main-proxy"), nil
+		}
+		return conn, nil
+
+	case "second-proxy":
+		log.Printf("使用备用代理连接 %s (默认策略)", address)
+		conn, err := d.secondProxyDialer.DialStream(ctx, address)
+		if err != nil {
+			return nil, err
+		}
+		if d.domainStats != nil {
+			return NewDomainMonitoredConn(conn, host, d.domainStats, "second-proxy"), nil
+		}
+		return conn, nil
+
+	default:
+		// 如果默认策略不识别，使用主代理
+		log.Printf("使用主代理连接 %s (兜底)", address)
+		conn, err := d.mainProxyDialer.DialStream(ctx, address)
+		if err != nil {
+			return nil, err
+		}
+		if d.domainStats != nil {
+			return NewDomainMonitoredConn(conn, host, d.domainStats, "main-proxy"), nil
+		}
+		return conn, nil
+	}
 }
 
 // tcpStreamConn 实现了transport.StreamConn接口，包装了标准库的net.Conn
@@ -305,15 +430,15 @@ func matchDomain(rule, host string) bool {
 	return host == domain || strings.HasSuffix(host, dotRule)
 }
 
-// isWhitelisted 检查域名是否在白名单中，支持通配符匹配
-func (d *WhitelistDialer) isWhitelisted(host string) bool {
-	// 检查完整域名是否在白名单中
-	if d.whitelist[host] {
+// isDirectHost 检查域名是否在直连名单中，支持通配符匹配
+func (d *WhitelistDialer) isDirectHost(host string) bool {
+	// 检查完整域名是否在直连名单中
+	if d.directList[host] {
 		return true
 	}
 
-	// 检查是否匹配白名单中的规则
-	for rule := range d.whitelist {
+	// 检查是否匹配直连名单中的规则
+	for rule := range d.directList {
 		if matchDomain(rule, host) {
 			return true
 		}
@@ -322,25 +447,29 @@ func (d *WhitelistDialer) isWhitelisted(host string) bool {
 	return false
 }
 
-// shouldMonitor 检查域名是否应该被监控
-func (d *WhitelistDialer) shouldMonitor(host string) bool {
-	// 如果没有设置监控域名列表，则监控所有域名
-	if len(d.monitorDomains) == 0 {
+// isMainProxyHost 检查域名是否在主代理名单中，支持通配符匹配
+func (d *WhitelistDialer) isMainProxyHost(host string) bool {
+	if d.mainProxyList[host] {
 		return true
 	}
-
-	// 检查完整域名是否在监控列表中
-	if d.monitorDomains[host] {
-		return true
-	}
-
-	// 检查是否匹配监控列表中的规则
-	for rule := range d.monitorDomains {
+	for rule := range d.mainProxyList {
 		if matchDomain(rule, host) {
 			return true
 		}
 	}
+	return false
+}
 
+// isSecondProxyHost 检查域名是否在备用代理名单中，支持通配符匹配
+func (d *WhitelistDialer) isSecondProxyHost(host string) bool {
+	if d.secondProxyList[host] {
+		return true
+	}
+	for rule := range d.secondProxyList {
+		if matchDomain(rule, host) {
+			return true
+		}
+	}
 	return false
 }
 
@@ -519,11 +648,14 @@ func startSOCKS5Server(address string, dialer transport.StreamDialer) {
 }
 
 func main() {
-	transportFlag := flag.String("transport", "", "Transport config")
+	mainProxyFlag := flag.String("main-proxy", "", "Main proxy transport config")
+	secondProxyFlag := flag.String("second-proxy", "", "Second proxy transport config")
 	addrFlag := flag.String("localAddr", "localhost:1080", "Local proxy address")
 	urlProxyPrefixFlag := flag.String("urlProxyPrefix", "/proxy", "Path where to run the URL proxy. Set to empty (\"\") to disable it.")
-	whitelistFileFlag := flag.String("whitelist-file", "", "Path to file containing domains to bypass proxy (one per line)")
-	monitorDomainsFlag := flag.String("monitorDomains", "", "Comma-separated list of domains to monitor traffic for (empty = monitor all)")
+	directFileFlag := flag.String("direct-file", "", "Path to file of domains to connect directly (one per line)")
+	mainProxyFileFlag := flag.String("main-proxy-file", "", "Path to file of domains to use main proxy (one per line)")
+	secondProxyFileFlag := flag.String("second-proxy-file", "", "Path to file of domains to use second proxy (one per line)")
+	defaultFlag := flag.String("default", "main-proxy", "Default behavior for domains not in lists: 'direct', 'main-proxy', or 'second-proxy'")
 	socketPortFlag := flag.String("socket-port", "", "Port to run SOCKS5 proxy on (e.g., '1082')")
 
 	// 自定义 help 信息
@@ -534,26 +666,37 @@ func main() {
 		fmt.Fprintf(os.Stderr, "选项:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\n示例:\n")
-		fmt.Fprintf(os.Stderr, "  # 基本用法 - 启动HTTP代理\n")
-		fmt.Fprintf(os.Stderr, "  KEY=ss://ENCRYPTION_KEY@HOST:PORT/\n")
-		fmt.Fprintf(os.Stderr, "  %s -transport \"$KEY\" -localAddr 0.0.0.0:1080\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  # 基本用法 - 使用主代理\n")
+		fmt.Fprintf(os.Stderr, "  MAIN_KEY=ss://ENCRYPTION_KEY@HOST:PORT/\n")
+		fmt.Fprintf(os.Stderr, "  %s -main-proxy \"$MAIN_KEY\" -localAddr 0.0.0.0:1080\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  # 使用主代理+备用代理\n")
+		fmt.Fprintf(os.Stderr, "  SECOND_KEY=ss://ENCRYPTION_KEY2@HOST2:PORT/\n")
+		fmt.Fprintf(os.Stderr, "  %s -main-proxy \"$MAIN_KEY\" -second-proxy \"$SECOND_KEY\" -localAddr 0.0.0.0:1080\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  # 同时启动HTTP和SOCKS5代理\n")
-		fmt.Fprintf(os.Stderr, "  %s -transport \"$KEY\" -localAddr 0.0.0.0:1080 -socket-port 1082\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  # 使用白名单文件\n")
-		fmt.Fprintf(os.Stderr, "  echo -e \"265.com\\n.zzxworld.com\" > whitelist.txt\n")
-		fmt.Fprintf(os.Stderr, "  %s -transport \"$KEY\" -whitelist-file whitelist.txt\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  # 监控特定域名流量\n")
-		fmt.Fprintf(os.Stderr, "  %s -transport \"$KEY\" -monitorDomains \"api.anthropic.com,*.openai.com\"\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -main-proxy \"$MAIN_KEY\" -localAddr 0.0.0.0:1080 -socket-port 1082\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  # 使用直连/代理名单\n")
+		fmt.Fprintf(os.Stderr, "  echo -e \"265.com\\n.zzxworld.com\" > direct.txt\n")
+		fmt.Fprintf(os.Stderr, "  echo -e \"api.example.com\\n.openai.com\" > main-proxy.txt\n")
+		fmt.Fprintf(os.Stderr, "  echo -e \"backup.example.com\\n.fallback.com\" > second-proxy.txt\n")
+		fmt.Fprintf(os.Stderr, "  %s -main-proxy \"$MAIN_KEY\" -second-proxy \"$SECOND_KEY\" \\\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "    -direct-file direct.txt -main-proxy-file main-proxy.txt \\\n")
+		fmt.Fprintf(os.Stderr, "    -second-proxy-file second-proxy.txt -default main-proxy\n\n")
 		fmt.Fprintf(os.Stderr, "  # 完整示例\n")
-		fmt.Fprintf(os.Stderr, "  %s -transport \"$KEY\" \\\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "    -localAddr 0.0.0.0:1080 \\\n")
-		fmt.Fprintf(os.Stderr, "    -socket-port 1082 \\\n")
-		fmt.Fprintf(os.Stderr, "    -whitelist-file whitelist.txt \\\n")
-		fmt.Fprintf(os.Stderr, "    -monitorDomains \"api.anthropic.com,*.openai.com\"\n\n")
-		fmt.Fprintf(os.Stderr, "白名单文件格式:\n")
+		fmt.Fprintf(os.Stderr, "  %s -main-proxy \"$MAIN_KEY\" -second-proxy \"$SECOND_KEY\" \\\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "    -localAddr 0.0.0.0:1080 -socket-port 1082 \\\n")
+		fmt.Fprintf(os.Stderr, "    -direct-file direct.txt \\\n")
+		fmt.Fprintf(os.Stderr, "    -main-proxy-file main-proxy.txt \\\n")
+		fmt.Fprintf(os.Stderr, "    -second-proxy-file second-proxy.txt \\\n")
+		fmt.Fprintf(os.Stderr, "    -default main-proxy \\\n")
+		fmt.Fprintf(os.Stderr, "\n")
+		fmt.Fprintf(os.Stderr, "名单文件格式(直连/代理):\n")
 		fmt.Fprintf(os.Stderr, "  265.com          # 完全匹配\n")
 		fmt.Fprintf(os.Stderr, "  .zzxworld.com    # 匹配该域名及其所有子域名\n")
 		fmt.Fprintf(os.Stderr, "  # 注释行\n\n")
+		fmt.Fprintf(os.Stderr, "默认策略:\n")
+		fmt.Fprintf(os.Stderr, "  direct      - 域名不在任何名单时直连\n")
+		fmt.Fprintf(os.Stderr, "  main-proxy  - 域名不在任何名单时走主代理\n")
+		fmt.Fprintf(os.Stderr, "  second-proxy - 域名不在任何名单时走备用代理\n\n")
 		fmt.Fprintf(os.Stderr, "服务端点:\n")
 		fmt.Fprintf(os.Stderr, "  HTTP代理:   http://localhost:1080\n")
 		fmt.Fprintf(os.Stderr, "  SOCKS5代理: socks5://localhost:1082 (如果启用)\n")
@@ -562,41 +705,88 @@ func main() {
 
 	flag.Parse()
 
-	// 创建原始拨号器
-	baseDialer, err := configurl.NewDefaultProviders().NewStreamDialer(context.Background(), *transportFlag)
+	// 创建主代理拨号器
+	mainDialer, err := configurl.NewDefaultProviders().NewStreamDialer(context.Background(), *mainProxyFlag)
 	if err != nil {
-		log.Fatalf("Could not create dialer: %v", err)
+		log.Fatalf("Could not create main proxy dialer: %v", err)
 	}
 
-	// 从文件读取白名单域名
-	var whitelistDomains []string
-	if *whitelistFileFlag != "" {
-		content, err := os.ReadFile(*whitelistFileFlag)
+	// 创建备用代理拨号器（如果配置了的话）
+	var secondDialer transport.StreamDialer
+	if *secondProxyFlag != "" {
+		secondDialer, err = configurl.NewDefaultProviders().NewStreamDialer(context.Background(), *secondProxyFlag)
 		if err != nil {
-			log.Fatalf("无法读取白名单文件 %s: %v", *whitelistFileFlag, err)
+			log.Fatalf("Could not create second proxy dialer: %v", err)
+		}
+	}
+
+	// 从文件读取直连域名
+	var directDomains []string
+	if *directFileFlag != "" {
+		content, err := os.ReadFile(*directFileFlag)
+		if err != nil {
+			log.Fatalf("无法读取直连名单文件 %s: %v", *directFileFlag, err)
 		}
 		lines := strings.Split(string(content), "\n")
 		for _, line := range lines {
 			line = strings.TrimSpace(line)
 			if line != "" && !strings.HasPrefix(line, "#") {
-				whitelistDomains = append(whitelistDomains, line)
+				directDomains = append(directDomains, line)
 			}
 		}
-		log.Printf("从文件 %s 读取到 %d 个白名单域名", *whitelistFileFlag, len(whitelistDomains))
+		log.Printf("从文件 %s 读取到 %d 个直连域名", *directFileFlag, len(directDomains))
 	}
 
-	// 解析监控域名
-	var monitorDomains []string
-	if *monitorDomainsFlag != "" {
-		monitorDomains = strings.Split(*monitorDomainsFlag, ",")
-		log.Printf("监控域名: %v", monitorDomains)
+	// 从文件读取主代理域名
+	var mainProxyDomains []string
+	if *mainProxyFileFlag != "" {
+		content, err := os.ReadFile(*mainProxyFileFlag)
+		if err != nil {
+			log.Fatalf("无法读取主代理名单文件 %s: %v", *mainProxyFileFlag, err)
+		}
+		lines := strings.Split(string(content), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line != "" && !strings.HasPrefix(line, "#") {
+				mainProxyDomains = append(mainProxyDomains, line)
+			}
+		}
+		log.Printf("从文件 %s 读取到 %d 个主代理域名", *mainProxyFileFlag, len(mainProxyDomains))
+	}
+
+	// 从文件读取备用代理域名
+	var secondProxyDomains []string
+	if *secondProxyFileFlag != "" {
+		content, err := os.ReadFile(*secondProxyFileFlag)
+		if err != nil {
+			log.Fatalf("无法读取备用代理名单文件 %s: %v", *secondProxyFileFlag, err)
+		}
+		lines := strings.Split(string(content), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line != "" && !strings.HasPrefix(line, "#") {
+				secondProxyDomains = append(secondProxyDomains, line)
+			}
+		}
+		log.Printf("从文件 %s 读取到 %d 个备用代理域名", *secondProxyFileFlag, len(secondProxyDomains))
 	}
 
 	// 创建域名流量统计
 	domainStats := NewDomainTrafficStats()
 
-	// 创建带白名单的拨号器
-	dialer := NewWhitelistDialer(baseDialer, whitelistDomains, monitorDomains, domainStats)
+	// 校验默认策略
+	defaultBehavior := strings.ToLower(strings.TrimSpace(*defaultFlag))
+	if defaultBehavior != "direct" && defaultBehavior != "main-proxy" && defaultBehavior != "second-proxy" {
+		log.Fatalf("无效的 -default 值: %s，应为 'direct'、'main-proxy' 或 'second-proxy'", defaultBehavior)
+	}
+
+	// 如果没有配置备用代理，但默认策略是 second-proxy，则错误
+	if defaultBehavior == "second-proxy" && secondDialer == nil {
+		log.Fatalf("-default 设置为 'second-proxy'，但未配置 -second-proxy 参数")
+	}
+
+	// 创建带直连/代理名单及默认策略的拨号器
+	dialer := NewWhitelistDialer(mainDialer, secondDialer, directDomains, mainProxyDomains, secondProxyDomains, defaultBehavior, domainStats)
 
 	// 如果指定了SOCKS5端口，启动SOCKS5代理服务器
 	if *socketPortFlag != "" {
@@ -626,6 +816,10 @@ func main() {
 			globalStats := domainStats.GetGlobalStats()
 			allDomainStats := domainStats.GetAllDomainStats()
 
+			mainProxyStats := domainStats.GetMainProxyStats()
+			secondProxyStats := domainStats.GetSecondProxyStats()
+			directStats := domainStats.GetDirectStats()
+
 			// 构建完整的统计响应
 			response := map[string]any{
 				"uploadBytes":            formatBytes(globalStats.GetUploadBytes()),
@@ -635,6 +829,29 @@ func main() {
 				"activeConnections":      globalStats.GetActiveConnections(),
 				"totalConnections":       globalStats.GetTotalConnections(),
 				"monitoredDomains":       allDomainStats,
+				"proxyStats": map[string]any{
+					"mainProxy": map[string]any{
+						"uploadBytes":            formatBytes(mainProxyStats.GetUploadBytes()),
+						"downloadBytes":          formatBytes(mainProxyStats.GetDownloadBytes()),
+						"currentSessionDuration": formatDuration(mainProxyStats.GetCurrentSessionDuration()),
+						"activeConnections":      mainProxyStats.GetActiveConnections(),
+						"totalConnections":       mainProxyStats.GetTotalConnections(),
+					},
+					"secondProxy": map[string]any{
+						"uploadBytes":            formatBytes(secondProxyStats.GetUploadBytes()),
+						"downloadBytes":          formatBytes(secondProxyStats.GetDownloadBytes()),
+						"currentSessionDuration": formatDuration(secondProxyStats.GetCurrentSessionDuration()),
+						"activeConnections":      secondProxyStats.GetActiveConnections(),
+						"totalConnections":       secondProxyStats.GetTotalConnections(),
+					},
+					"direct": map[string]any{
+						"uploadBytes":            formatBytes(directStats.GetUploadBytes()),
+						"downloadBytes":          formatBytes(directStats.GetDownloadBytes()),
+						"currentSessionDuration": formatDuration(directStats.GetCurrentSessionDuration()),
+						"activeConnections":      directStats.GetActiveConnections(),
+						"totalConnections":       directStats.GetTotalConnections(),
+					},
+				},
 			}
 
 			jsonData, err := json.MarshalIndent(response, "", "  ")
