@@ -171,70 +171,63 @@ func (dts *DomainTrafficStats) GetDirectStats() *httpproxy.TrafficStats {
 
 // DomainMonitoredConn 带域名跟踪的连接包装器
 type DomainMonitoredConn struct {
-	transport.StreamConn
-	domain      string
-	domainStats *DomainTrafficStats
-	globalConn  transport.StreamConn // 用于全局统计的连接
-	typeConn    transport.StreamConn // 用于类型统计的连接(main-proxy/second-proxy/direct)
-	connType    string               // 连接类型：main-proxy, second-proxy, direct
+    // 嵌入外层监控连接（已叠加：全局统计 + 类型统计）
+    transport.StreamConn
+    domain      string
+    domainStats *DomainTrafficStats
 }
 
 // NewDomainMonitoredConn 创建带域名跟踪的连接
 func NewDomainMonitoredConn(conn transport.StreamConn, domain string, domainStats *DomainTrafficStats, connType string) *DomainMonitoredConn {
-	// 为全局统计创建监控连接
-	globalConn := httpproxy.NewMonitoredConn(conn, domainStats.GetGlobalStats())
+    // 先用全局统计包装连接，再按类型统计再包装一层，保证同一次 I/O 同步计入两处统计。
+    wrapped := httpproxy.NewMonitoredConn(conn, domainStats.GetGlobalStats())
 
-	// 根据连接类型创建相应的统计连接
-	var typeConn transport.StreamConn
-	switch connType {
-	case "main-proxy":
-		typeConn = httpproxy.NewMonitoredConn(conn, domainStats.GetMainProxyStats())
-	case "second-proxy":
-		typeConn = httpproxy.NewMonitoredConn(conn, domainStats.GetSecondProxyStats())
-	case "direct":
-		typeConn = httpproxy.NewMonitoredConn(conn, domainStats.GetDirectStats())
-	default:
-		// 默认使用主代理统计
-		typeConn = httpproxy.NewMonitoredConn(conn, domainStats.GetMainProxyStats())
-	}
+    // 根据连接类型创建相应的统计连接（在全局统计之上再包一层）
+    var typeConn transport.StreamConn
+    switch connType {
+    case "main-proxy":
+        typeConn = httpproxy.NewMonitoredConn(wrapped, domainStats.GetMainProxyStats())
+    case "second-proxy":
+        typeConn = httpproxy.NewMonitoredConn(wrapped, domainStats.GetSecondProxyStats())
+    case "direct":
+        typeConn = httpproxy.NewMonitoredConn(wrapped, domainStats.GetDirectStats())
+    default:
+        // 默认使用主代理统计
+        typeConn = httpproxy.NewMonitoredConn(wrapped, domainStats.GetMainProxyStats())
+    }
 
-	return &DomainMonitoredConn{
-		StreamConn:  conn,
-		domain:      domain,
-		domainStats: domainStats,
-		globalConn:  globalConn,
-		typeConn:    typeConn,
-		connType:    connType,
-	}
+    return &DomainMonitoredConn{
+        // 将外层监控连接作为嵌入字段，确保其他 net.Conn 方法也走监控包装后的连接
+        StreamConn:  typeConn,
+        domain:      domain,
+        domainStats: domainStats,
+    }
 }
 
 // Read 重写读取方法以跟踪下载流量
 func (dmc *DomainMonitoredConn) Read(b []byte) (int, error) {
-	n, err := dmc.typeConn.Read(b)
-	if n > 0 {
-		// 同时更新全局统计和域名统计
-		dmc.globalConn.Read(make([]byte, 0)) // 触发全局统计更新
-		dmc.domainStats.AddTraffic(dmc.domain, 0, int64(n))
-	}
-	return n, err
+    n, err := dmc.StreamConn.Read(b)
+    if n > 0 {
+        // 域名维度统计（全局与类型统计由链式 MonitoredConn 自动完成）
+        dmc.domainStats.AddTraffic(dmc.domain, 0, int64(n))
+    }
+    return n, err
 }
 
 // Write 重写写入方法以跟踪上传流量
 func (dmc *DomainMonitoredConn) Write(b []byte) (int, error) {
-	n, err := dmc.typeConn.Write(b)
-	if n > 0 {
-		// 同时更新全局统计和域名统计
-		dmc.globalConn.Write(make([]byte, 0)) // 触发全局统计更新
-		dmc.domainStats.AddTraffic(dmc.domain, int64(n), 0)
-	}
-	return n, err
+    n, err := dmc.StreamConn.Write(b)
+    if n > 0 {
+        // 域名维度统计（全局与类型统计由链式 MonitoredConn 自动完成）
+        dmc.domainStats.AddTraffic(dmc.domain, int64(n), 0)
+    }
+    return n, err
 }
 
 // Close 重写关闭方法
 func (dmc *DomainMonitoredConn) Close() error {
-	// 关闭两个连接
-	dmc.globalConn.Close()
-	return dmc.typeConn.Close()
+    // 关闭包装后的监控连接
+    return dmc.StreamConn.Close()
 }
 
 // WhitelistDialer 实现了一个带有直连/代理名单并支持默认策略的拨号器
