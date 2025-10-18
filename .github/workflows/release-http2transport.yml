@@ -62,6 +62,7 @@ jobs:
 
       - name: Package with config directory
         working-directory: ${{ github.workspace }}/x/examples/http2transport
+        shell: bash
         run: |
           mkdir -p package
           cp ${{ matrix.output }} package/
