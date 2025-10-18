@@ -60,18 +60,25 @@ jobs:
         run: |
           go build -ldflags='-s -w' -o ${{ matrix.output }} .
 
-      - name: Package with config directory
+      - name: Package with config directory (Unix)
+        if: matrix.goos != 'windows'
         working-directory: ${{ github.workspace }}/x/examples/http2transport
         shell: bash
         run: |
           mkdir -p package
           cp ${{ matrix.output }} package/
           cp -r config package/
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            cd package && zip -r ../http2transport-${{ matrix.goos }}-${{ matrix.goarch }}.zip . && cd ..
-          else
-            tar -czf http2transport-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz -C package .
-          fi
+          tar -czf http2transport-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz -C package .
+
+      - name: Package with config directory (Windows)
+        if: matrix.goos == 'windows'
+        working-directory: ${{ github.workspace }}/x/examples/http2transport
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package
+          Copy-Item ${{ matrix.output }} package/
+          Copy-Item -Recurse config package/
+          Compress-Archive -Path package/* -DestinationPath http2transport-${{ matrix.goos }}-${{ matrix.goarch }}.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
