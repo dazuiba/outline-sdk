@@ -89,7 +89,7 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: "*"
+          pattern: "http2transport-*"
           path: ./artifacts
 
       - name: Display structure of downloaded files
