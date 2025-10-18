@@ -92,28 +92,16 @@ MAIN_KEY=ss://ENCRYPTION_KEY@HOST:PORT/
 
 ## 部署示例(pm2)
 
-执行: pm2 start config.js
+使用提供的配置文件：[`x/examples/http2transport/config/pm2.config.js`](x/examples/http2transport/config/pm2.config.js)
 
-config.js
-```javascript
-const KEY_OUT = 'ss://YOUR_KEY';
-module.exports = {
-  apps: [
-    {
-      name: 'outline-bwg',
-      script: '/bin/bash',
-      args: [
-        '-lc',
-        '/Users/sam/.bin/http2transport -main-proxy "$KEY_OUT" -localAddr 0.0.0.0:1080 -socket-port 1079 -direct-file config/direct.txt -default main-proxy'
-      ],
-      env: {
-        KEY_OUT: KEY_OUT
-      },
-      autorestart: true,
-      restart_delay: 2000
-    }
-  ]
-};
+**步骤：**
+
+1. 编辑配置文件，修改 `KEY_OUT` 为你的 Shadowsocks 密钥
+2. 修改 http2transport 二进制文件路径（默认：`/Users/sam/.bin/http2transport`）
+3. 执行部署：
+
+```bash
+pm2 start x/examples/http2transport/config/pm2.config.js
 ```
 
 ## 配置系统 Proxy

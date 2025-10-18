@@ -1,0 +1,162 @@
+name: Release http2transport
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g., v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build http2transport
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            output: http2transport-linux-amd64
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            output: http2transport-linux-arm64
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+            output: http2transport-darwin-amd64
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            output: http2transport-darwin-arm64
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            output: http2transport-windows-amd64.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version-file: "${{ github.workspace }}/x/go.mod"
+
+      - name: Build http2transport
+        working-directory: ${{ github.workspace }}/x/examples/http2transport
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          go build -ldflags='-s -w' -o ${{ matrix.output }} .
+
+      - name: Package with config directory
+        working-directory: ${{ github.workspace }}/x/examples/http2transport
+        run: |
+          mkdir -p package
+          cp ${{ matrix.output }} package/
+          cp -r config package/
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            cd package && zip -r ../http2transport-${{ matrix.goos }}-${{ matrix.goarch }}.zip . && cd ..
+          else
+            tar -czf http2transport-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz -C package .
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: http2transport-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ${{ github.workspace }}/x/examples/http2transport/http2transport-${{ matrix.goos }}-${{ matrix.goarch }}.*
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: ./artifacts
+
+      - name: Display structure of downloaded files
+        run: ls -R ./artifacts
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" == "release" ]; then
+            echo "tag=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: http2transport ${{ steps.tag.outputs.tag }}
+          body: |
+            ## http2transport Release ${{ steps.tag.outputs.tag }}
+
+            HTTP/SOCKS5 proxy server with domain-based routing support.
+
+            ### Downloads
+
+            Each package includes:
+            - Binary executable for the platform
+            - `config/` directory with:
+              - `direct.txt` - Domain whitelist for direct connection
+              - `pm2.config.js` - PM2 deployment configuration
+              - `xbar-proxy-switcher.sh` - macOS proxy switcher script
+
+            Choose the package for your platform:
+            - **Linux AMD64**: `http2transport-linux-amd64.tar.gz`
+            - **Linux ARM64**: `http2transport-linux-arm64.tar.gz`
+            - **macOS Intel**: `http2transport-darwin-amd64.tar.gz`
+            - **macOS Apple Silicon**: `http2transport-darwin-arm64.tar.gz`
+            - **Windows**: `http2transport-windows-amd64.zip`
+
+            ### Quick Start
+
+            ```bash
+            # Extract (Linux/macOS)
+            tar -xzf http2transport-*.tar.gz
+            cd http2transport-*
+
+            # Make executable (Linux/macOS)
+            chmod +x http2transport-*
+
+            # Run
+            ./http2transport-* -main-proxy "ss://YOUR_KEY" -localAddr 0.0.0.0:1080 -socket-port 1079 -direct-file config/direct.txt
+            ```
+
+            ### PM2 Deployment
+
+            ```bash
+            # Edit config/pm2.config.js with your settings
+            pm2 start config/pm2.config.js
+            ```
+
+            For complete documentation, see [README.md](https://github.com/Jigsaw-Code/outline-sdk/blob/main/README.md)
+          files: |
+            ./artifacts/http2transport-linux-amd64/http2transport-linux-amd64.tar.gz
+            ./artifacts/http2transport-linux-arm64/http2transport-linux-arm64.tar.gz
+            ./artifacts/http2transport-darwin-amd64/http2transport-darwin-amd64.tar.gz
+            ./artifacts/http2transport-darwin-arm64/http2transport-darwin-arm64.tar.gz
+            ./artifacts/http2transport-windows-amd64/http2transport-windows-amd64.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
