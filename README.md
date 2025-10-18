@@ -1,269 +1,138 @@
-# Outline SDK (Beta)
+# HTTP2Transport - HTTP 和 SOCKS5 代理服务器
 
-[![Build Status](https://github.com/Jigsaw-Code/outline-sdk/actions/workflows/test.yml/badge.svg)](https://github.com/Jigsaw-Code/outline-sdk/actions/workflows/test.yml?query=branch%3Amain)
-[![Go Report Card](https://goreportcard.com/badge/github.com/Jigsaw-Code/outline-sdk)](https://goreportcard.com/report/github.com/Jigsaw-Code/outline-sdk)
-[![Go Reference](https://pkg.go.dev/badge/github.com/Jigsaw-Code/outline-sdk.svg)](https://pkg.go.dev/github.com/Jigsaw-Code/outline-sdk)
+> **基于 [Outline SDK](https://github.com/Jigsaw-Code/outline-sdk) 开发**
 
-<p align="center">
-<img src="https://github.com/Jigsaw-Code/outline-brand/blob/main/assets/powered_by_outline/color/logo.png?raw=true" width=400pt />
-</p>
+本工具提供一个本地 HTTP CONNECT 代理，并可选开启 SOCKS5 代理。可基于 Outline/Shadowsocks 等传输配置进行拨号，并支持直连/主代理的域名名单与统计接口。
 
-> [!Note]
-> This code is under active development and not guaranteed to be stable. If you are
-> interested in integrating with it, we'd love your [feedback](https://github.com/Jigsaw-Code/outline-sdk/issues/new).
+## 功能特性
 
-The Outline SDK allows you to:
+- 同时提供 HTTP CONNECT 和 SOCKS5 代理服务
+- 基于域名名单的智能路由（直连/代理）
+- 支持 Shadowsocks 和其他 Outline 传输协议
+- 实时流量统计接口
+- 支持多平台（Linux、macOS、Windows）
 
-- Create tools to protect against network-level interference.
-- [Add network-level interference protection to existing apps](#add-the-sdk-to-your-app), such as content or communication apps.
-- Troubleshoot connectivity and measure interference with a collection of [command-line tools](#command-line-tools).
+## 快速开始
 
-## Table of Contents
+### 构建
 
-<details>
-<summary>Click to expand</summary>
-
-- [Advantages](#advantages)
-  - [Interoperable and Reusable](#interoperable-and-reusable)
-  - [Bypass DNS-based Blocking](#bypass-dns-based-blocking)
-  - [Bypass SNI-based Blocking](#bypass-sni-based-blocking)
-  - [Tunnel Connections over a Proxy](#tunnel-connections-over-a-proxy)
-  - [Build a VPN](#build-a-vpn)
-- [Add the SDK to Your App](#add-the-sdk-to-your-app)
-  - [Generated Mobile Library](#generated-mobile-library)
-  - [Side Service](#side-service)
-  - [Go Library](#go-library)
-  - [Generated C Library](#generated-c-library)
-- [Wrap your website in a SDK-enabled App](#wrap-your-website-in-a-sdk-enabled-app)
-- [Command-line Tools](#command-line-tools)
-  - [Resolve a Domain Name](#resolve-a-domain-name)
-  - [Fetch a Web Page](#fetch-a-web-page)
-  - [Run a Local Forward Proxy](#run-a-local-forward-proxy)
-  - [Test Proxy Connectivity](#test-proxy-connectivity)
-  - [Test Download Speed](#test-download-speed)
-
-</details>
-
-## Advantages
-
-| Multi-Platform | Proven Technology | Composable |
-|:-:|:-:|:-:|
-| Supports Android, iOS, Windows, macOS and Linux. | Field-tested in the Outline Client and Server, helping millions to access the internet under harsh conditions. | Designed for modularity and reuse, allowing you to craft custom transports. |
-
-### Interoperable and Reusable
-
-The Outline SDK is built upon a simple basic concepts, defined as interoperable interfaces that allow for composition and easy reuse.
-
-**Connections** enable communication between two endpoints over an abstract transport. There are two types of connections:
-  - `transport.StreamConn`: stream-based connection, like TCP and the `SOCK_STREAM` Posix socket type.
-  - `transport.PacketConn`: datagram-based connection, like UDP and the `SOCK_DGRAM` Posix socket type. We use "Packet" instead of "Datagram" because that is the convention in the Go standard library.
-
-Connections can be wrapped to create nested connections over a new transport. For example, a `StreamConn` could be over TCP, over TLS over TCP, over HTTP over TLS over TCP, over QUIC, among other options.
-
-**Dialers** enable the creation of connections given a host:port address while encapsulating the underlying transport or proxy protocol. The `StreamDialer` and `PacketDialer` types create `StreamConn` and `PacketConn` connections, respectively, given an address. Dialers can also be nested. For example, a TLS Stream Dialer can use a TCP dialer to create a `StreamConn` backed by a TCP connection, then create a TLS `StreamConn` backed by the TCP `StreamConn`. A SOCKS5-over-TLS Dialer could use the TLS Dialer to create the TLS `StreamConn` to the proxy before doing the SOCKS5 connection to the target address.
-
-**Resolvers** (`dns.Resolver`) enable the answering of DNS questions while encapsulating the underlying algorithm or protocol. Resolvers are primarily used to map domain names to IP addresses.
-
-
-### Bypass DNS-based Blocking
-
-The Outline SDK offers two types of strategies for evading DNS-based blocking: resilient DNS or address override.
-
-- The [dns](https://pkg.go.dev/github.com/Jigsaw-Code/outline-sdk/dns) package can replace the resolution based on the system resolver with more resillient options:
-  - Encrypted DNS over HTTPS (DoH) or TLS (DoT)
-  - Alternative hosts and ports for UDP and TCP resolvers, making it possible to use resolvers that are not blocked.
-- The `override` config from [x/configurl](https://pkg.go.dev/github.com/Jigsaw-Code/outline-sdk/x/configurl) with a `host` option can be used to force a specific address,
-  or you can implement your own Dialer that can map addresses.
-
-### Bypass SNI-based Blocking
-
-The Outline SDK offers several strategies for evading SNI-based blocking:
-
-At the TCP layer:
-
-- TCP stream fragmentation with [transport/split](https://pkg.go.dev/github.com/Jigsaw-Code/outline-sdk/transport/split)
-- TLS record fragmentation with [transport/tlsfrag](https://pkg.go.dev/github.com/Jigsaw-Code/outline-sdk/transport/tlsfrag)
-
-At the application layer:
-
-- Domain-fronting and SNI hiding with [transport/tls](https://pkg.go.dev/github.com/Jigsaw-Code/outline-sdk/transport/tls)
-
-
-### Tunnel Connections over a Proxy
-
-The Outline SDK offers two protocols to create connections over proxies:
-
-- Shadowsocks, available in [transport/shadowsocks](https://pkg.go.dev/github.com/Jigsaw-Code/outline-sdk/transport/shadowsocks).
-  Easily create servers in the cloud using the [Outline Manager](https://getoutline.org/get-started/#step-1).
-- SOCKS5, available in [transport/socks5](https://pkg.go.dev/github.com/Jigsaw-Code/outline-sdk/transport/socks5). You can leverage a [local SOCKS5 proxy that tunnels connections over SSH](https://www.digitalocean.com/community/tutorials/how-to-route-web-traffic-securely-without-a-vpn-using-a-socks-tunnel).
-
-### Build a VPN
-
-Use the [network](https://pkg.go.dev/github.com/Jigsaw-Code/outline-sdk/network) package to create TUN-based VPNs using transport-layer proxies (often called "tun2socks").
-
-
-## Add the SDK to Your App
-
-Choose from one of the following methods to integrate the Outline SDK into your project:
-
-- **Generated Mobile Library**: For Android, iOS, and macOS apps. Uses [`gomobile bind`](https://pkg.go.dev/golang.org/x/mobile/cmd/gomobile) to generate Java and Objective-C bindings.
-- **Side Service**: For desktop and Android apps. Runs a standalone Go binary that your application communicates with (not available on iOS due to subprocess limitations).
-- **Go Library**: Directly import the SDK into your Go application. [API Reference](https://pkg.go.dev/github.com/Jigsaw-Code/outline-sdk).
-- **Generated C Library**: Generate C bindings using [`go build`](https://pkg.go.dev/cmd/go#hdr-Build_modes).
-
-The Outline Client uses a **generated mobile library** on Android, iOS and macOS (based on Cordova) and a **side service** on Windows and Linux (based on Electron).
-
-Below we provide more details on each integration approach. For more details about setting up and using Outline SDK features, see the [Discussions tab](https://github.com/Jigsaw-Code/outline-sdk/discussions).
-
-### Generated Mobile Library
-
-See our [MobileProxy page](./x/mobileproxy/) to learn about the easiest way to integrate the Outline SDK into a mobile app. It runs a local forward proxy that implements resillience strategies that you can use to configure your app's networking libraries.
-
-For advanced users, it is possible to generate your own mobile library, following these steps:
-
-1. **Create a Go library**: Create a Go package that wraps the SDK functionalities you need.
-1. **Generate mobile library**: Use [`gomobile bind`](https://pkg.go.dev/golang.org/x/mobile/cmd/gomobile) to generate Android Archives (AAR) and Apple Frameworks with Java and Objective-C bindings.
-    - Android examples: [Outline Android Archive](https://github.com/Jigsaw-Code/outline-go-tun2socks/blob/dada2652ae2c6205f2daa3f88c805bbd6b28a713/Makefile#L27), [Intra Android Archive](https://github.com/Jigsaw-Code/outline-go-tun2socks/blob/dada2652ae2c6205f2daa3f88c805bbd6b28a713/Makefile#L21).
-    - Apple examples: [Outline iOS Framework](https://github.com/Jigsaw-Code/outline-go-tun2socks/blob/dada2652ae2c6205f2daa3f88c805bbd6b28a713/Makefile#L30), [Outline macOS Framework](https://github.com/Jigsaw-Code/outline-go-tun2socks/blob/dada2652ae2c6205f2daa3f88c805bbd6b28a713/Makefile#L36).
-1. **Integrate into your app**: Add the generated library to your app. For more details, see Go Mobile's [SDK applications and generating bindings](https://github.com/golang/go/wiki/Mobile#sdk-applications-and-generating-bindings).
-
-> **Note**: You must use `gomobile bind` on the package you create, not directly on the SDK packages.
-
-
-### Side Service
-
-To integrate the SDK as a side service, follow these steps:
-
-1. **Define IPC mechanism**: Choose an inter-process communication (IPC) mechanism (for example, sockets, standard I/O).
-1. **Build the service**: Create a Go binary that includes the server-side of the IPC and used the SDK.
-    - Examples: [Outline Electron backend code](https://github.com/Jigsaw-Code/outline-go-tun2socks/blob/master/outline/electron/main.go), [Outline Windows Client backend build](https://github.com/Jigsaw-Code/outline-go-tun2socks/blob/dada2652ae2c6205f2daa3f88c805bbd6b28a713/Makefile#L67), [Outline Linux Client backend build](https://github.com/Jigsaw-Code/outline-go-tun2socks/blob/dada2652ae2c6205f2daa3f88c805bbd6b28a713/Makefile#L56).
-1. **Bundle the service**: Include the Go binary in your application bundle.
-    - Examples: [Outline Windows Client](https://github.com/Jigsaw-Code/outline-client/blob/b06819922037230ee3ba9471097c40793af819e8/src/electron/electron-builder.json#L21), [Outline Linux Client](https://github.com/Jigsaw-Code/outline-client/blob/b06819922037230ee3ba9471097c40793af819e8/src/electron/electron-builder.json#L10)
-1. **Start the service**: Launch the Go binary as a subprocess from your application.
-    - Example: [Outline Electron Clients](https://github.com/Jigsaw-Code/outline-client/blob/b06819922037230ee3ba9471097c40793af819e8/src/electron/go_vpn_tunnel.ts#L227)
-1. **Service Calls**: Add code to your app for communication with the service.
-
-
-### Go Library
-
-To integrate the Outline SDK as a Go library, you can directly import it into your Go application. See the [API Reference](https://pkg.go.dev/github.com/Jigsaw-Code/outline-sdk) for what's available.
-
-This approach is suitable for both command-line and GUI-based applications. You can build GUI-based applications in Go with frameworks like [Wails](https://wails.io/), [Fyne.io](https://fyne.io/), [Qt for Go](https://therecipe.github.io/qt/), or [Go Mobile app](https://pkg.go.dev/golang.org/x/mobile/app).
-
-For examples, see [x/examples](./x/examples/).
-
-### Generated C Library
-
-This approach is suited for applications that require C bindings. It is similar to the Generated Mobile Library approach, where you need to first create a Go library to generate bindings for.
-
-Steps:
-
-1. **Create a Go library**: Create a Go package that wraps the SDK functionalities you need. Functions to be exported must be marked with `//export`, as described in the [cgo documentation](https://pkg.go.dev/cmd/cgo#hdr-C_references_to_Go).
-1. **Generate C library**: Use `go build` with the [appropriate `-buildmode` flag](https://pkg.go.dev/cmd/go#hdr-Build_modes). Anternatively, you can use [SWIG](https://swig.org/Doc4.1/Go.html#Go).
-1. **Integrate into your app**: Add the generated C library to your application, according to your build system.
-
-You can find detailed steps at the tutorial [Go for beginners: Getting started](https://github.com/Jigsaw-Code/outline-sdk/discussions/67).
-
-## Wrap your website in a SDK-enabled App
-
-See our [Web Wrapper example](./x/examples/website-wrapper-app/) for a simple way to package your existing website into a mobile app with built-in resilience features provided by the Outline SDK.
-
-## Command-line Tools
-
-The Outline SDK has several command-line utilities that illustrate the usage of the SDK, but are also valuable for debugging and trying the different strategies without having to build an app.
-
-They all take a `-transport` flag with a config that specifies what transport should be used to establish connections.
-The config format can be found in [x/configurl](https://pkg.go.dev/github.com/Jigsaw-Code/outline-sdk/x/configurl).
-
-
-### Resolve a Domain Name
-
-The [`resolve` tool](https://pkg.go.dev/github.com/Jigsaw-Code/outline-sdk/x/examples/resolve) resolves a domain name, similar to `dig`:
-
-```console
-$ go run github.com/Jigsaw-Code/outline-sdk/x/examples/resolve@latest -type A -transport "tls" -resolver 8.8.8.8:853 -tcp getoutline.org.
-216.239.34.21
-216.239.32.21
-216.239.38.21
-216.239.36.21
+```bash
+cd x/examples/http2transport
+go build
 ```
 
+### 运行
 
-### Fetch a Web Page
-
-The [`fetch` tool](https://pkg.go.dev/github.com/Jigsaw-Code/outline-sdk/x/examples/fetch) fetches
-a URL, similar to `curl`. The example below would bypass blocking of `meduza.io` in Russia:
-
-```console
-$ go run github.com/Jigsaw-Code/outline-sdk/x/examples/fetch@latest -transport "override:host=cloudflare.net|tlsfrag:1" -method HEAD -v https://meduza.io/
-[DEBUG] 2023/12/28 18:44:56.490836 main.go:105: Cf-Ray: [83cdac8ecdccc40e-EWR]
-[DEBUG] 2023/12/28 18:44:56.491231 main.go:105: Alt-Svc: [h3=":443"; ma=86400]
-[DEBUG] 2023/12/28 18:44:56.491237 main.go:105: Date: [Thu, 28 Dec 2023 23:44:56 GMT]
-[DEBUG] 2023/12/28 18:44:56.491241 main.go:105: Connection: [keep-alive]
-[DEBUG] 2023/12/28 18:44:56.491247 main.go:105: Strict-Transport-Security: [max-age=31536000; includeSubDomains; preload]
-[DEBUG] 2023/12/28 18:44:56.491251 main.go:105: Cache-Control: [max-age=0 no-cache, no-store]
-[DEBUG] 2023/12/28 18:44:56.491257 main.go:105: X-Content-Type-Options: [nosniff]
-[DEBUG] 2023/12/28 18:44:56.491262 main.go:105: Server: [cloudflare]
-[DEBUG] 2023/12/28 18:44:56.491266 main.go:105: Content-Type: [text/html; charset=utf-8]
-[DEBUG] 2023/12/28 18:44:56.491270 main.go:105: Expires: [Thu, 28 Dec 2023 23:44:56 GMT]
-[DEBUG] 2023/12/28 18:44:56.491273 main.go:105: Cf-Cache-Status: [DYNAMIC]
+基本用法：
+```bash
+MAIN_KEY=ss://ENCRYPTION_KEY@HOST:PORT/
+./http2transport -main-proxy "$MAIN_KEY" -localAddr 0.0.0.0:1080
 ```
 
-### Run a Local Forward Proxy
-
-The [`http2transport` tool](https://pkg.go.dev/github.com/Jigsaw-Code/outline-sdk/x/examples/http2transport) runs a local proxy that creates connections according to the transport. It's effectively a circumvention tool.
-
-The example below is analogous to the previous fetch example.
-
-Start the local proxy:
-
-```console
-$ go run github.com/Jigsaw-Code/outline-sdk/x/examples/http2transport@latest -transport "override:host=cloudflare.net|tlsfrag:1" -localAddr localhost:8080
-2023/12/28 18:50:48 Proxy listening on 127.0.0.1:8080
+同时启动 HTTP 和 SOCKS5 代理：
+```bash
+./http2transport -main-proxy "$MAIN_KEY" -localAddr 0.0.0.0:1080 -socket-port 1079
 ```
 
-Using the proxy with `curl`:
-
-```console
-$ curl -p -x http://localhost:8080 https://meduza.io --head
-HTTP/1.1 200 Connection established
-
-HTTP/2 200
-date: Thu, 28 Dec 2023 23:51:01 GMT
-content-type: text/html; charset=utf-8
-strict-transport-security: max-age=31536000; includeSubDomains; preload
-expires: Thu, 28 Dec 2023 23:51:01 GMT
-cache-control: max-age=0
-cache-control: no-cache, no-store
-cf-cache-status: DYNAMIC
-x-content-type-options: nosniff
-server: cloudflare
-cf-ray: 83cdb579bbec4376-EWR
-alt-svc: h3=":443"; ma=86400
+使用域名路由：
+```bash
+./http2transport -main-proxy "$MAIN_KEY" \
+  -localAddr 0.0.0.0:1080 -socket-port 1079 \
+  -direct-file config/direct.txt \
+  -default main-proxy
 ```
 
-### Test Proxy Connectivity
+## 服务端点
 
-The [`test-connectivity` tool](https://pkg.go.dev/github.com/Jigsaw-Code/outline-sdk/x/examples/test-connectivity) is useful to test connectivity to a proxy. It uses DNS resolutions over TCP and UDP using the transport to test if there is stream and datagram connectivity.
+- **HTTP 代理**: `http://localhost:1080`
+- **SOCKS5 代理**: `socks5://localhost:1079`（若启用）
+- **统计接口**: `http://localhost:1080/stats`
 
-```console
-$ go run github.com/Jigsaw-Code/outline-sdk/x/examples/test-connectivity@latest -transport "$OUTLINE_KEY" && echo success || echo failure
-{"resolver":"8.8.8.8:53","proto":"tcp","time":"2023-12-28T23:57:45Z","duration_ms":39,"error":null}
-{"resolver":"8.8.8.8:53","proto":"udp","time":"2023-12-28T23:57:45Z","duration_ms":17,"error":null}
-{"resolver":"[2001:4860:4860::8888]:53","proto":"tcp","time":"2023-12-28T23:57:45Z","duration_ms":31,"error":null}
-{"resolver":"[2001:4860:4860::8888]:53","proto":"udp","time":"2023-12-28T23:57:45Z","duration_ms":16,"error":null}
-success
+## 命令行选项
+
+使用 `-h` 查看所有可用选项：
+
+```
+./http2transport -h
 ```
 
-### Test Download Speed
+常用选项：
+- `-main-proxy` string: 主代理传输配置（必填，例：`ss://...`）
+- `-localAddr` string: 本地 HTTP 代理监听地址，默认 `localhost:1080`
+- `-socket-port` string: 启动 SOCKS5 代理的端口（例如 `1082`，留空则不启用）
+- `-urlProxyPrefix` string: URL 代理路径前缀，默认 `/proxy`，设为空字符串关闭
+- `-direct-file` string: 直连域名名单文件路径（每行一个）
+- `-main-proxy-file` string: 走主代理域名名单文件路径（每行一个）
+- `-default` string: 默认策略，`direct` 或 `main-proxy`，默认 `main-proxy`
 
-The [`fetch-speed` tool](https://pkg.go.dev/github.com/Jigsaw-Code/outline-sdk/x/examples/fetch-speed) fetches
-a URL, similar to `curl` and calculates the download speed. It could be used for troubleshooting.
+## 域名路由配置
 
-```console
-$ go run github.com/Jigsaw-Code/outline-sdk/x/examples/fetch@latest -transport ss://[redacted]@[redacted]:80 http://speedtest.ftp.otenet.gr/files/test10Mb.db
+### 域名名单文件格式
 
-Downloaded 10.00 MB in 1.78s
+域名名单文件每行一个域名，支持：
+- 精确匹配：`example.com`
+- 子域名匹配：`.example.com` (匹配所有子域名)
+- 注释：以 `#` 开头的行
 
-Downloaded Speed: 5.61 MB/s
+示例 `config/direct.txt`：
 ```
+# 国内常用网站直连
+.baidu.com
+.qq.com
+.taobao.com
+```
+
+### 路由策略
+
+使用 `-default` 参数设置默认策略：
+- `main-proxy`: 默认走代理，仅 `-direct-file` 中的域名直连
+- `direct`: 默认直连，仅 `-main-proxy-file` 中的域名走代理
+
+更多监控细节与移动端集成，可参见 `README_MONITORING.md`。
+
+## 部署示例(pm2)
+
+执行: pm2 start config.js
+
+config.js
+```javascript
+const KEY_OUT = 'ss://YOUR_KEY';
+module.exports = {
+  apps: [
+    {
+      name: 'outline-bwg',
+      script: '/bin/bash',
+      args: [
+        '-lc',
+        '/Users/sam/.bin/http2transport -main-proxy "$KEY_OUT" -localAddr 0.0.0.0:1080 -socket-port 1079 -direct-file config/direct.txt -default main-proxy'
+      ],
+      env: {
+        KEY_OUT: KEY_OUT
+      },
+      autorestart: true,
+      restart_delay: 2000
+    }
+  ]
+};
+```
+
+## 配置系统 Proxy
+
+### 使用 xbar 快速切换代理
+
+[xbar](https://xbarapp.com/) 是一个 macOS 菜单栏工具，可以通过脚本快速切换系统代理设置。
+
+**安装步骤：**
+
+1. 安装 xbar 应用
+2. 打开 xbar，选择 "Open Plugins Folder"
+3. 将 [`x/examples/http2transport/config/xbar-proxy-switcher.sh`](x/examples/http2transport/config/xbar-proxy-switcher.sh) 复制到 plugins 目录
+4. 根据需要修改脚本中的端口配置（默认 HTTP: 1080, SOCKS: 1079）
+5. xbar 会自动加载脚本，在菜单栏显示代理状态图标
+
+**使用说明：**
+
+- 点击菜单栏图标可以快速开启/关闭系统代理
+- 🇬🇧 表示代理已开启
+- 🇪🇸 表示代理已关闭
+- 脚本会同时配置 HTTP 和 SOCKS5 代理
