@@ -1,3 +1,5 @@
+//go:build http2transport_tests
+
 package main
 
 import (
