@@ -44,7 +44,7 @@ jobs:
 
     steps:
       - name: Check out code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v4
@@ -73,7 +73,7 @@ jobs:
           fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: http2transport-${{ matrix.goos }}-${{ matrix.goarch }}
           path: ${{ github.workspace }}/x/examples/http2transport/http2transport-${{ matrix.goos }}-${{ matrix.goarch }}.*
@@ -86,8 +86,9 @@ jobs:
 
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
+          pattern: "*"
           path: ./artifacts
 
       - name: Display structure of downloaded files
